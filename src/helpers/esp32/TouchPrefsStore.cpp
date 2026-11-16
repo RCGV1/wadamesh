@@ -10,7 +10,10 @@
 #include "SdNvsPrefs.h"   // NVS, or SD /meshcomod fallback when NVS is unusable (Launcher)
 
 #include <Preferences.h>
-#include <SPIFFS.h>
+#include <SPIFFS.h> // Keep the framework dependency visible to PlatformIO LDF.
+#if defined(WADA_MESHTASTIC)
+#include "WadaStorage.h"
+#endif
 #include "esp_system.h"   // esp_random()
 #include "mbedtls/md.h"   // SHA-256 for the unlock PIN
 #include <stddef.h>   // offsetof

@@ -5,7 +5,11 @@
 #include "i18n_builtin.h"   // generated: baked-in translations, one deflated blob per language
 #include <stdlib.h>
 #include "esp_heap_caps.h"
+#if defined(WADA_MESHTASTIC)
+#include <miniz.h>
+#else
 #include "rom/miniz.h"      // the S3 ROM's tinfl: inflating costs no flash
+#endif
 #endif
 
 // Native language names shown in the picker. Index order == UiLang.

@@ -4,6 +4,10 @@
 #define LV_CONF_H
 #endif
 
+#if defined(WADA_MESHTASTIC)
+#define LV_FONT_MONTSERRAT_14 0
+#endif
+
 #define LV_COLOR_DEPTH 16
 #define LV_COLOR_16_SWAP 0
 
@@ -49,7 +53,9 @@
 // scroll, cancelling the click — the button showed its press style but the
 // CLICKED handler never fired ("nothing happens"). 24 px keeps taps reliable
 // while still allowing a deliberate drag to scroll.
+#if !defined(WADA_MESHTASTIC)
 #define LV_INDEV_DEF_SCROLL_LIMIT 24
+#endif
 
 #define LV_USE_LOG 0
 

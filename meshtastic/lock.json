@@ -1,0 +1,10 @@
+{
+  "format": 1,
+  "wadamesh_base": "26578cdc87896c78d533c00568846ecdd7dcfb2b",
+  "firmware": {
+    "repository": "https://github.com/RCGV1/firmware-Fork.git",
+    "revision": "9885f93c8ebb0136d4c880c010c32884a06bf9fe",
+    "protobuf_revision": "8d0ed0c135f91ad1d6f9c60bc341277d64946bce"
+  },
+  "android_behavior_reference": "846c3a103769d378c649ba37c911c224eac1f761"
+}

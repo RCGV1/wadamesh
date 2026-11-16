@@ -8,7 +8,10 @@
 #else
 #include <SD.h>
 #endif
-#include <SPIFFS.h>
+#include <SPIFFS.h> // Keep the framework dependency visible to PlatformIO LDF.
+#if defined(WADA_MESHTASTIC)
+#include "WadaStorage.h"
+#endif
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/semphr.h>

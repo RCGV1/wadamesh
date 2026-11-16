@@ -14,7 +14,11 @@
 // The command backend. Both of these already exist and are what the LVGL
 // Terminal app uses, so console mode inherits the full command set rather than
 // growing a private one.
-#include "../MyMesh.h"   // declares the_mesh itself (a reference on PSRAM boards)
+#if defined(WADA_MESHTASTIC) || defined(WADA_WEB)
+#include "WebMesh.h"
+#else
+#include "../MyMesh.h"
+#endif
 #if defined(ESP32)
   #include "../helpers/esp32/TouchPrefsStore.h"
   #include "../helpers/esp32/WifiRuntimeStore.h"   // wifiConfigGetRadioEnabled

@@ -46,15 +46,23 @@ public:
   // silently dropped every longer name. The PERSISTED width is frozen separately
   // (k_ui_disk_sender_len in UITask.cpp) — raising this does not move any on-disk field.
   static const int MAX_SENDER_NAME = 31;
-  static const int MAX_MSG_TEXT = 160;   // full LoRa text length (was 96 -> cut long msgs ~3 lines)
+#if defined(WADA_MESHTASTIC)
+  static const int MAX_MSG_TEXT = 233;
+#else
+  static const int MAX_MSG_TEXT = 160;
+#endif
   static const int MAX_UI_PATH = 32;  // inbound-route bytes/message for the Info popup (covers deep + multi-byte-hash routes)
 
-  // Outgoing-DM delivery state. None for incoming + channel messages.
+  // Persisted native delivery states for outgoing channel and direct messages.
   enum : uint8_t {
     DELIV_NONE      = 0,  // unknown (incoming msgs, channel posts, or pre-ACK history loaded from disk)
+    DELIV_PENDING   = 4,
     DELIV_SENT      = 1,  // sendMessage returned SENT_*, ack not yet received
     DELIV_DELIVERED = 2,  // ack matched in MyMesh::processAck → onMessageAcked
-    DELIV_FAILED    = 3,  // sendMessage returned FAILED
+    DELIV_FAILED    = 3,  // native routing or local submission failure
+    DELIV_MESH      = 5,  // a broadcast was acknowledged by a relay
+    DELIV_RELAYED   = 6,  // a DM was relayed; recipient has not acknowledged
+    DELIV_UNCONFIRMED = 7, // external sender did not request an ACK
   };
 
   // Per-message RX metadata. Populated from the LoRa packet at receive time
@@ -102,6 +110,7 @@ public:
     bool outgoing;
     uint32_t ack_hash;       // expected-ack for outgoing DMs (0 if none / channel / incoming)
     uint8_t  deliv_state;    // see DELIV_* above; defaults to DELIV_NONE
+    uint8_t  delivery_error; // native Routing.Error or local interruption; outgoing only
     uint8_t  meta_flags;     // see MSG_META_* (0 = no RX metadata)
     uint8_t  path_len;       // hop count for flood packets; 0xFF for direct/routed; 0 if unknown
     int8_t   snr_q4;         // SNR × 4 (matches on-wire encoding); 0 if unknown
@@ -116,6 +125,8 @@ public:
     char thread[MAX_THREAD_NAME + 1];
     char sender[MAX_SENDER_NAME + 1];
     char text[MAX_MSG_TEXT + 1];
+    uint8_t native_channel_identity[32];
+    uint8_t native_conversation_id[6];
   };
 
   struct UIThread {
@@ -126,11 +137,11 @@ public:
     uint32_t last_ts;
     /** Mesh contact index for DM sends, or -1 if unknown / not mapped. */
     int16_t mesh_contact_idx;
-    /** Full contact pubkey for stable DM mapping across refresh/reorders. */
+    /** Stable DM node handle, or full native channel identity for channel history. */
     uint8_t mesh_contact_pub[32];
-    /** First 6 bytes of contact pubkey for stable DM mapping across reorders. */
+    /** DM node prefix, or random stable conversation ID for native channels. */
     uint8_t mesh_contact_key6[6];
-    /** Channel slot index for group sends, or -1 if unknown. */
+    /** Channel slot for group sends, or -1 for archived/unavailable channels. */
     int16_t mesh_channel_slot;
     /** DM only: the user wiped this chat with "Delete history", so the row stays in the
      *  inbox with no messages behind it. Without this an empty DM is indistinguishable
@@ -269,6 +280,9 @@ public:
   bool lookupActiveContact(ContactInfo& out) const;
 private:
   void syncThreadMeshSlots(const char* thread_name, bool channel);
+  void refreshNativeChannels();
+  bool ensureNativeChannelConversation(int index);
+  void repairNativeChannelHistory();
   int findThreadByName(const char* name, bool channel) const;
   void sortThreadsByRecent(bool channel_mode, int out_indexes[], int& out_count) const;
   int appendMessage(const char* thread, const char* sender, const char* text, bool channel, bool outgoing, bool mark_unread, uint32_t ack_hash = 0, uint8_t deliv_state = DELIV_NONE,
@@ -278,11 +292,17 @@ private:
   // Shared core for newMsg / newMsgFromPubWithMeta — see UITask.cpp.
   void newMsgImpl(uint8_t path_len, const char* from_name, const char* text, int msgcount,
                   uint8_t meta_flags, int8_t snr_q4, int8_t rssi,
-                  const char* sender_override = nullptr);
+                  const char* sender_override = nullptr, bool native_muted = false);
 public:
   /** Match an arriving ACK (4-byte hash) against the last few outgoing DMs
    *  and flip their delivery state to DELIV_DELIVERED so the chat detail
    *  shows the double-check. No-op if no match. */
+  void onMeshtasticDelivery(uint32_t id, uint8_t state, uint8_t error = 0);
+  void onMeshtasticTrace(const char *report);
+  void onMeshtasticNodeRemoval(uint32_t node, bool removed, const char* reason);
+  void onMeshtasticTelemetry(uint32_t node, uint8_t kind);
+  void onMeshtasticTelemetryStatus(uint32_t node, uint8_t kind, const char* message);
+  void onMeshtasticUnsyncedChannel(const char *text, bool outgoing, uint32_t id);
   void onMessageAcked(uint32_t ack_hash);
   /** Trace-ping reply landed: open a modal with the bidirectional SNR
    *  numbers. Called by MyMesh::onTraceRecv when the trace's tag matches
@@ -408,6 +428,7 @@ public:
     return _ui_threads[_active_thread_idx].mesh_channel_slot;
   }
   int  activeThreadIdx() const { return _active_thread_idx; }
+  bool channelThreadAvailable(int idx) const;
   /** Any thread's pinned mesh-channel slot (-1 when not a channel / out of range).
    *  chatDeleteApply prefers this (name-validated) over a pure name scan so
    *  deleting a channel actually drops its mesh-table entry — otherwise
@@ -550,12 +571,12 @@ public:
   void enableTcp() { if (_serial) _serial->enableTcp(); }
   void disableTcp() { if (_serial) _serial->disableTcp(); }
   bool hasBleCapability() const { return _serial && _serial->hasBleCapability(); }
-  bool isBleEnabled() const { return _serial && _serial->isBleEnabled(); }
+  bool isBleEnabled() const;
   // Live BLE enable. The concrete transport applies its heap guard only for a
   // cold NimBLE allocation; re-enabling a pre-created stack is allocation-free.
   // Returns false when a required cold start cannot be made safely.
   bool enableBle();
-  void disableBle() { if (_serial) _serial->disableBle(); }
+  void disableBle();
   // The companion transport, for board code that knows its concrete type.
   BaseSerialInterface* serialInterface() const { return _serial; }
   int getWsConnectedCount() const { return _serial ? _serial->getWsConnectedCount() : 0; }

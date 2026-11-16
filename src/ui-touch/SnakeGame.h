@@ -13,7 +13,7 @@
 // tap to restart after a game over; the X closes it. One instance at a time.
 //
 // Decoupled from UITask internals — depends only on LVGL and lvglPsramAlloc.
-class SnakeGame {
+class WadaSnakeGame {
 public:
   static void launch();                 // open (no-op if already open)
   static bool isOpen();                 // UITask: gate the trackball + tab bar
@@ -24,7 +24,7 @@ public:
   static void dismiss();
 
 private:
-  ~SnakeGame();   // frees the canvas buffer, after the queued root delete released the canvas
+  ~WadaSnakeGame();   // frees the canvas buffer, after the queued root delete released the canvas
 
   // The playfield grid is sized to the screen at open() (cols_ x rows_), capped
   // by these maxima so the body arrays are fixed-size.
@@ -64,7 +64,7 @@ private:
   void setDir(int dx, int dy);
   void updateScoreLabel();
 
-  static SnakeGame* s_active;           // the one live game (or nullptr)
+  static WadaSnakeGame* s_active;           // the one live game (or nullptr)
   static void timerCb(lv_timer_t* t);
   static void gestureCb(lv_event_t* e);
   static void tapCb(lv_event_t* e);

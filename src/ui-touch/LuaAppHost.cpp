@@ -4,6 +4,9 @@
 //   2. the wada.* bindings (ui/input/timer/sys/store) — API v1
 //   3. lifecycle: launch -> run chunk -> callbacks via guarded pcall -> dismiss
 #include "LuaAppHost.h"
+#if defined(WADA_MESHTASTIC)
+#include "WadaMeshtasticBackend.h"
+#endif
 #if defined(ESP32)
 #include "mbedtls/md.h"      // wada.crypto: HMAC/SHA in C, not interpreted Lua
 #endif
@@ -1077,6 +1080,12 @@ int sysBeep(lua_State* L) { lua_pushboolean(L, luaHostBeep()); return 1; }
 // CAP_LUA_SDK_EXT in device_caps.h), and a store app runs on all of them.
 int sysCaps(lua_State* L) {
   lua_createtable(L, 0, 20);
+#if defined(WADA_MESHTASTIC)
+  lua_pushstring(L, "meshtastic"); lua_setfield(L, -2, "protocol");
+  lua_pushboolean(L, 1); lua_setfield(L, -2, "native_node_ids");
+  lua_pushboolean(L, 0); lua_setfield(L, -2, "radio_airtime");
+  lua_pushboolean(L, 0); lua_setfield(L, -2, "raw_rf_stats");
+#endif
   lua_pushboolean(L, CAP_LUA_SDK_EXT);  lua_setfield(L, -2, "sdk_ext");
   lua_pushboolean(L, CAP_KEYBOARD);     lua_setfield(L, -2, "keyboard");
   lua_pushboolean(L, CAP_TOUCH);        lua_setfield(L, -2, "touch");
@@ -1090,12 +1099,24 @@ int sysCaps(lua_State* L) {
   lua_setfield(L, -2, "audio_sd");
   // Feature flags for the calls added after the first extended SDK shipped, so
   // an app can degrade instead of erroring on firmware that predates them.
-  lua_pushboolean(L, CAP_LUA_SDK_EXT);  lua_setfield(L, -2, "discover");   // wada.mesh.discover
+#if defined(WADA_MESHTASTIC)
+  lua_pushboolean(L, 0);  lua_setfield(L, -2, "discover");   // wada.mesh.discover
+#else
+  lua_pushboolean(L, CAP_LUA_SDK_EXT); lua_setfield(L, -2, "discover");
+#endif
   lua_pushboolean(L, 1);                lua_setfield(L, -2, "input");      // wada.ui.input
   lua_pushboolean(L, 1);                lua_setfield(L, -2, "input_len");  // wada.ui.input's max_len
-  lua_pushboolean(L, 1);                lua_setfield(L, -2, "rx_identity");// rx_log pubkey/src/dst
+#if defined(WADA_MESHTASTIC)
+  lua_pushboolean(L, 0);                lua_setfield(L, -2, "rx_identity");// rx_log pubkey/src/dst
+#else
+  lua_pushboolean(L, 1); lua_setfield(L, -2, "rx_identity");
+#endif
   lua_pushboolean(L, 1);                lua_setfield(L, -2, "list");       // wada.ui.list
-  lua_pushboolean(L, 1);                lua_setfield(L, -2, "packets");    // app.on_packet
+#if defined(WADA_MESHTASTIC)
+  lua_pushboolean(L, 0);                lua_setfield(L, -2, "packets");    // app.on_packet
+#else
+  lua_pushboolean(L, 1); lua_setfield(L, -2, "packets");
+#endif
   lua_pushboolean(L, 1);                lua_setfield(L, -2, "measure");    // ui.text_w / text_lines
   lua_pushboolean(L, CAP_SENSORS);      lua_setfield(L, -2, "sensors");    // wada.sys.env
   lua_pushboolean(L, CAP_LUA_SDK_EXT);  lua_setfield(L, -2, "map");        // wada.map.view
@@ -1609,6 +1630,11 @@ int meshSendDm(lua_State* L) {
 static const uint32_t kMeshProbeMinGapMs = 15000;   // per app
 
 int meshDiscover(lua_State* L) {
+#if defined(WADA_MESHTASTIC)
+  lua_pushboolean(L, 0);
+  lua_pushstring(L, "MeshCore discovery is unavailable on Meshtastic; use native node information");
+  return 2;
+#endif
   const int types = (int)luaL_optinteger(L, 1, 0);
   if (!s_h) { lua_pushboolean(L, 0); lua_pushstring(L, "no app"); return 2; }
   const int perm = luaHostProbePerm(s_h->id);
@@ -2492,7 +2518,11 @@ int meshContacts(lua_State* L) {
                           &lat6, &lon6)) break;
     lua_createtable(L, 0, 8);
     lua_pushstring(L, name);          lua_setfield(L, -2, "name");
+#if defined(WADA_MESHTASTIC)
+    lua_pushstring(L, pk);            lua_setfield(L, -2, "node_id");
+#else
     lua_pushstring(L, pk);            lua_setfield(L, -2, "pubkey");
+#endif
     lua_pushinteger(L, type);         lua_setfield(L, -2, "type");
     lua_pushinteger(L, (lua_Integer)ago); lua_setfield(L, -2, "ago_s");
     lua_pushnumber(L, lat);           lua_setfield(L, -2, "lat");
@@ -2633,6 +2663,29 @@ void packetPollCb(lv_timer_t* t) {
 }
 
 int meshStats(lua_State* L) {
+#if defined(WADA_MESHTASTIC)
+  lua_createtable(L, 0, 7);
+  lua_pushboolean(L, wadaBackend && wadaBackend->ownsPrefs()); lua_setfield(L, -2, "available");
+  lua_pushboolean(L, 0); lua_setfield(L, -2, "airtime_available");
+  lua_pushboolean(L, 0); lua_setfield(L, -2, "rf_measurements_available");
+  if (wadaBackend && wadaBackend->ownsPrefs()) {
+    lua_pushinteger(L, wadaBackend->packetsSent()); lua_setfield(L, -2, "api_packets_submitted");
+    lua_pushinteger(L, wadaBackend->packetsRecv()); lua_setfield(L, -2, "mesh_packets_received");
+    const auto &radio = wadaBackend->loraConfig();
+    lua_createtable(L, 0, 8);
+    lua_pushstring(L, wada::regionName(radio.region)); lua_setfield(L, -2, "region");
+    lua_pushstring(L, wada::effectivePresetName(radio.modem_preset, radio.use_preset)); lua_setfield(L, -2, "modem_preset");
+    lua_pushboolean(L, radio.use_preset); lua_setfield(L, -2, "use_preset");
+    lua_pushinteger(L, radio.hop_limit); lua_setfield(L, -2, "hop_limit");
+    lua_pushinteger(L, radio.channel_num); lua_setfield(L, -2, "configured_frequency_slot");
+    lua_pushboolean(L, radio.tx_enabled); lua_setfield(L, -2, "tx_enabled");
+    const unsigned overrideRate = wada::normalizedCodingRate(radio.modem_preset, radio.coding_rate);
+    lua_pushinteger(L, radio.use_preset ? (overrideRate ? overrideRate : wada::presetCodingRate(radio.modem_preset))
+                                     : radio.coding_rate); lua_setfield(L, -2, "coding_rate");
+    lua_setfield(L, -2, "lora");
+  }
+  return 1;
+#endif
   float rssi, noise; uint32_t rx_air, tx_air, rx_pkts, rx_err; int budget;
   luaHostRadioStats(&rssi, &noise, &rx_air, &tx_air, &rx_pkts, &rx_err, &budget);
   lua_createtable(L, 0, 7);
@@ -2659,7 +2712,11 @@ int meshSelf(lua_State* L) {
   luaHostSelfInfo(name, sizeof name, &lat, &lon, pk, sizeof pk, &lat6, &lon6);
   lua_createtable(L, 0, 6);
   lua_pushstring(L, name);  lua_setfield(L, -2, "name");
+#if defined(WADA_MESHTASTIC)
+  lua_pushstring(L, pk);    lua_setfield(L, -2, "node_id");
+#else
   lua_pushstring(L, pk);    lua_setfield(L, -2, "pubkey");
+#endif
   lua_pushnumber(L, lat);   lua_setfield(L, -2, "lat");
   lua_pushnumber(L, lon);   lua_setfield(L, -2, "lon");
   lua_pushinteger(L, lat6); lua_setfield(L, -2, "lat_e6");

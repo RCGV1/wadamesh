@@ -7,13 +7,62 @@
 
 <p align="center"><b>A real touchscreen UI for your mesh radio.</b> &middot; open source &middot; GPL-3.0</p>
 
-Touch-UI [MeshCore](https://github.com/meshcore-dev/MeshCore) companion-radio
-firmware for the **LilyGo T-Deck / T-Deck Plus**, **Heltec V4 + TFT** and other boards
-(ESP32-S3).
+WADAMESH is an LVGL touch UI for mesh radios. This fork supports the existing
+[MeshCore](https://github.com/meshcore-dev/MeshCore) builds and adds a native
+[Meshtastic](https://github.com/meshtastic/firmware) backend for the LilyGo T-Deck.
 
-An LVGL touch UI (map, chat, contacts, channels, settings) split out of
-[meshcomod](https://github.com/ALLFATHER-BV/meshcomod). The app depends on a
-MeshCore fork via PlatformIO `lib_deps`.
+The shared UI lives in `src/ui-touch/`. The Meshtastic adapter lives in
+`meshtastic/app/`; its firmware dependency is pinned in
+[`meshtastic/lock.json`](meshtastic/lock.json). Meshtastic owns the radio,
+routing, encryption, node database and device services.
+
+## Meshtastic T-Deck build
+
+Requirements: macOS or Linux, Git, Python 3.10+ and PlatformIO Core 6.2+. The native toolchain
+was tested with Core 6.2.1b2; older stable Core installations cannot build the
+pinned ESP32 platform. Use a Python environment containing a compatible Core,
+or pass `--pio-python /path/to/python` to the build command.
+
+```sh
+git clone --branch meshtastic https://github.com/RCGV1/wadamesh.git
+cd wadamesh
+python3 scripts/meshtastic.py build
+```
+
+The wrapper initializes the locked firmware/protobuf dependencies and creates
+an ignored, detached firmware worktree under `.meshtastic/`. Its application
+library links to this repository's UI, includes, backend and tests. The pinned
+dependency checkout remains clean; there is no maintained second UI copy.
+
+Images are written to
+`.meshtastic/firmware-<revision>/.pio/build/t-deck-tft/`; source revisions and image
+hashes are recorded in `.meshtastic/build-info.json`. The wrapper builds only;
+it has no upload or device-connection command.
+
+For host regression tests and the offline graphical simulator, install Clang,
+CMake 3.20+ and SDL2, then run:
+
+```sh
+python3 scripts/meshtastic.py test
+python3 scripts/meshtastic.py sim-test
+# Optional: launch the built simulator yourself
+desktop/build/wadamesh-meshtastic-sim
+```
+
+The simulator compiles the shared UI and native adapter with a deterministic
+local radio fixture. It does not execute native radio routing or cryptography
+and opens no serial, Bluetooth or TCP connection. Hardware/RF validation remains
+required. The native target currently covers the T-Deck; the board statuses below
+refer to the original MeshCore backend.
+
+## MeshCore builds
+
+The original PlatformIO entrypoints remain available, including:
+
+```sh
+pio run -e LilyGo_TDeck_companion_radio_touch
+pio run -e heltec_v4_tft_companion_radio_usb_tcp_touch
+```
 
 ## Boards
 
@@ -36,21 +85,21 @@ per-board status.
 
 ## Architecture
 
-This repo holds only the **app**: the `companion_radio` glue, the `ui-touch`
+For MeshCore, this repo holds the **app**: the `companion_radio` glue, the `ui-touch`
 LVGL UI, each board's glue/variants, and `platformio.ini`. The **MeshCore
 core is not vendored here**: it's pulled as a library via `lib_deps` from the
 [`ALLFATHER-BV/meshcomod`](https://github.com/ALLFATHER-BV/meshcomod) monorepo
 (the same repo as the non-touch firmware), pinned by a lean source-only `core-*`
 git tag. The touch-app files this repo owns (TouchPrefsStore, WifiRuntimeStore,
 the transports, …) are dropped from the lib via `-DMC_VENDORED_TOUCH_APP` so they
-aren't compiled twice. The build is byte-identical to the original in-tree
-meshcomod firmware.
+aren't compiled twice. These dependencies and PlatformIO environments remain the MeshCore build path.
 
 Lua apps use the on-device SDK described in [LUA_APPS.md](LUA_APPS.md). For
 WAV/MP3 playback, including a ready-to-sideload transport test app and exact SD
 and internal-storage paths, see [AUDIO_PLAYBACK_TESTING.md](AUDIO_PLAYBACK_TESTING.md).
-Region discovery, known-region management, and per-channel flood scopes are
-described in [REGIONS.md](REGIONS.md).
+MeshCore region discovery, known-region management, and per-channel flood scopes
+are described in [REGIONS.md](REGIONS.md). Meshtastic uses its native LoRa region,
+channel configuration and hop limits instead.
 
 ## Offline map tiles
 

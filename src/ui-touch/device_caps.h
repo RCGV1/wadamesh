@@ -281,6 +281,12 @@
   #define CAP_LOCK_SCREEN  0
 #endif
 
+// Native images must never install MeshCore OTA releases.
+#if defined(WADA_MESHTASTIC)
+#undef CAP_OTA
+#define CAP_OTA 0
+#endif
+
 // Somewhere to keep map tiles: a tiles partition, or a card the map can fall back to.
 // 0 = the map says this board has none, instead of "reflash the tiles partition".
 #ifndef CAP_TILE_STORAGE

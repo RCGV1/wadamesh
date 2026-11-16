@@ -23,6 +23,17 @@ MeshCore
     Wi-Fi/BLE/UI hooks) is published under MIT, not GPL, so those hooks remain
     upstreamable to MeshCore.
 
+Meshtastic firmware (pinned submodule in meshtastic/firmware)
+    Copyright (c) Meshtastic contributors
+    GNU General Public License v3 — https://github.com/meshtastic/firmware
+    The native Meshtastic target uses the pinned firmware and protobuf schema.
+    Component license notices remain in the dependency checkout.
+
+miniz (host-test copy in meshtastic/tests/miniz)
+    Copyright 2013-2014 RAD Game Tools and Valve Software
+    Copyright 2010-2014 Rich Geldreich and Tenacious Software LLC
+    MIT License — see meshtastic/tests/miniz/LICENSE
+
 LVGL
     Copyright (c) LVGL Kft and contributors
     MIT License — https://lvgl.io

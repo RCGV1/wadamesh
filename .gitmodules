@@ -1,0 +1,5 @@
+[submodule "meshtastic/firmware"]
+	shallow = true
+	path = meshtastic/firmware
+	url = https://github.com/RCGV1/firmware-Fork.git
+	branch = wadamesh-meshtastic

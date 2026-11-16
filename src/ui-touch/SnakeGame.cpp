@@ -20,11 +20,11 @@ static constexpr uint32_t kColFood = 0xE0584C;   // food
 static constexpr uint32_t kColBody = 0x15B6A6;   // snake body (brand teal)
 static constexpr uint32_t kColText = 0xE6EAEE;
 
-SnakeGame* SnakeGame::s_active = nullptr;
+WadaSnakeGame* WadaSnakeGame::s_active = nullptr;
 
-bool SnakeGame::isOpen() { return s_active != nullptr && s_active->root_ != nullptr; }
+bool WadaSnakeGame::isOpen() { return s_active != nullptr && s_active->root_ != nullptr; }
 
-void SnakeGame::steer(int dx, int dy) {
+void WadaSnakeGame::steer(int dx, int dy) {
   if (!s_active || s_active->over_) return;
   // Trackball deltas -> one cardinal direction (dominant axis).
   if (dx == 0 && dy == 0) return;
@@ -36,16 +36,16 @@ void SnakeGame::steer(int dx, int dy) {
   else            s_active->setDir(0, dy > 0 ? 1 : -1);
 }
 
-void SnakeGame::launch() {
+void WadaSnakeGame::launch() {
   if (s_active) return;
-  SnakeGame* g = new SnakeGame();
+  WadaSnakeGame* g = new WadaSnakeGame();
   s_active = g;
   if (!g->open()) { s_active = nullptr; delete g; }
 }
 
-void SnakeGame::destroyAsync(void* p) { delete static_cast<SnakeGame*>(p); }
+void WadaSnakeGame::destroyAsync(void* p) { delete static_cast<WadaSnakeGame*>(p); }
 
-void SnakeGame::dismiss() {
+void WadaSnakeGame::dismiss() {
   // THE single close path — the tall bar's back hook (installed via appPageBegin) and any
   // other caller land here, so teardown happens once, in one order.
   //
@@ -53,9 +53,9 @@ void SnakeGame::dismiss() {
   // the instance is freed from an lv_async_call: this can run from inside an LVGL event
   // callback, and the old code deleted the root AND `this` synchronously from a child
   // button's own handler — freeing what LVGL was still dispatching to. Async calls run FIFO,
-  // so the root (and with it the canvas) dies before ~SnakeGame() frees the canvas buffer.
+  // so the root (and with it the canvas) dies before ~WadaSnakeGame() frees the canvas buffer.
   if (!s_active) return;
-  SnakeGame* g = s_active;
+  WadaSnakeGame* g = s_active;
   s_active = nullptr;
   g->close();
   lv_async_call(destroyAsync, g);
@@ -65,11 +65,11 @@ void SnakeGame::dismiss() {
 // deletion, so freeing buf_ there would leave a live canvas pointing at freed PSRAM for one
 // more frame. It is freed here instead: the destructor runs from the lv_async_call queued
 // after lv_obj_del_async, by which point the canvas is really gone.
-SnakeGame::~SnakeGame() {
+WadaSnakeGame::~WadaSnakeGame() {
   if (buf_) { lvglPsramFree(buf_); buf_ = nullptr; }
 }
 
-void SnakeGame::placeFood() {
+void WadaSnakeGame::placeFood() {
   const int cells = cols_ * rows_;
   for (int tries = 0; tries < 4 * cells + 16; ++tries) {
     const uint8_t fx = (uint8_t)random(cols_);
@@ -80,7 +80,7 @@ void SnakeGame::placeFood() {
   }
 }
 
-void SnakeGame::reset() {
+void WadaSnakeGame::reset() {
   len_ = 3;
   const uint8_t cx = (uint8_t)(cols_ / 2), cy = (uint8_t)(rows_ / 2);
   for (int i = 0; i < len_; ++i) { bx_[i] = (uint8_t)(cx - i); by_[i] = cy; }
@@ -89,7 +89,7 @@ void SnakeGame::reset() {
   placeFood();
 }
 
-void SnakeGame::render() {
+void WadaSnakeGame::render() {
   if (!canvas_) return;
   const int c = kCellPx;
   lv_canvas_fill_bg(canvas_, lv_color_hex(kColBg), LV_OPA_COVER);
@@ -103,7 +103,7 @@ void SnakeGame::render() {
   }
 }
 
-void SnakeGame::updateScoreLabel() {
+void WadaSnakeGame::updateScoreLabel() {
   if (!score_) return;
   if (over_)         lv_label_set_text_fmt(score_, TR("Game over  \xe2\x80\x94  score %d   (tap to restart)"), score_val_);
   else if (paused_)  lv_label_set_text_fmt(score_, TR("Paused  \xe2\x80\x94  score %d"), score_val_);
@@ -111,7 +111,7 @@ void SnakeGame::updateScoreLabel() {
   else               lv_label_set_text(score_, TR("Snake  \xe2\x80\x94  swipe, roll, or press a direction"));
 }
 
-void SnakeGame::step() {
+void WadaSnakeGame::step() {
   if (over_ || !started_ || paused_) return;
   if (!(ndx_ == -dx_ && ndy_ == -dy_)) { dx_ = ndx_; dy_ = ndy_; }
   const int nx = bx_[0] + dx_, ny = by_[0] + dy_;
@@ -131,9 +131,9 @@ void SnakeGame::step() {
   render();
 }
 
-void SnakeGame::setDir(int dx, int dy) { ndx_ = dx; ndy_ = dy; }
+void WadaSnakeGame::setDir(int dx, int dy) { ndx_ = dx; ndy_ = dy; }
 
-void SnakeGame::startGame() {
+void WadaSnakeGame::startGame() {
   if (started_) return;
   started_ = true;
   paused_  = false;
@@ -148,14 +148,14 @@ void SnakeGame::startGame() {
   if (!timer_) timer_ = lv_timer_create(timerCb, kStepMs, this);
 }
 
-void SnakeGame::togglePause() {
+void WadaSnakeGame::togglePause() {
   if (!started_ || over_) return;
   paused_ = !paused_;
   if (pause_lbl_) lv_label_set_text(pause_lbl_, paused_ ? LV_SYMBOL_PLAY : LV_SYMBOL_PAUSE);
   updateScoreLabel();
 }
 
-bool SnakeGame::open() {
+bool WadaSnakeGame::open() {
   const lv_coord_t sw = lv_disp_get_hor_res(nullptr);
   const lv_coord_t sh = lv_disp_get_ver_res(nullptr);
   // Page root + chrome, identical to the Spectrum page: opaque and CLICKABLE so nothing
@@ -171,7 +171,7 @@ bool SnakeGame::open() {
 // later can't turn the status-bar title into a dangling read.
   static char s_bar_title[24];
   snprintf(s_bar_title, sizeof s_bar_title, "%s", TR("Snake"));
-  appPageBegin(s_bar_title, &SnakeGame::dismiss);
+  appPageBegin(s_bar_title, &WadaSnakeGame::dismiss);
 
   // Fill the unoccupied screen below a 24-px score row. Whole cells only.
   const int avail_w = (int)sw;
@@ -213,23 +213,23 @@ bool SnakeGame::open() {
   return true;
 }
 
-void SnakeGame::close() {
+void WadaSnakeGame::close() {
   if (timer_) { lv_timer_del(timer_); timer_ = nullptr; }   // stop stepping before the UI goes
-  appPageEnd(&SnakeGame::dismiss);                          // hand the status bar back
+  appPageEnd(&WadaSnakeGame::dismiss);                          // hand the status bar back
   appPageDeleteRootAsync(root_);                            // never a sync del from a callback
   root_ = nullptr;
   canvas_ = nullptr; score_ = nullptr; start_btn_ = nullptr;
   pause_btn_ = nullptr; pause_lbl_ = nullptr;
-  // buf_ is freed in ~SnakeGame(), after the queued root delete has taken the canvas with it.
+  // buf_ is freed in ~WadaSnakeGame(), after the queued root delete has taken the canvas with it.
 }
 
 // ---- LVGL C-callback trampolines (user_data = the instance) ----
-void SnakeGame::timerCb(lv_timer_t* t) {
-  auto* self = static_cast<SnakeGame*>(t->user_data);
+void WadaSnakeGame::timerCb(lv_timer_t* t) {
+  auto* self = static_cast<WadaSnakeGame*>(t->user_data);
   if (self) self->step();
 }
-void SnakeGame::gestureCb(lv_event_t* e) {
-  auto* self = static_cast<SnakeGame*>(lv_event_get_user_data(e));
+void WadaSnakeGame::gestureCb(lv_event_t* e) {
+  auto* self = static_cast<WadaSnakeGame*>(lv_event_get_user_data(e));
   if (!self || !self->started_) return;
   switch (lv_indev_get_gesture_dir(lv_indev_get_act())) {
     case LV_DIR_TOP:    self->setDir(0, -1); break;
@@ -239,15 +239,15 @@ void SnakeGame::gestureCb(lv_event_t* e) {
     default: break;
   }
 }
-void SnakeGame::tapCb(lv_event_t* e) {
-  auto* self = static_cast<SnakeGame*>(lv_event_get_user_data(e));
+void WadaSnakeGame::tapCb(lv_event_t* e) {
+  auto* self = static_cast<WadaSnakeGame*>(lv_event_get_user_data(e));
   if (self && self->started_ && self->over_) { self->reset(); self->updateScoreLabel(); self->render(); }
 }
-void SnakeGame::startCb(lv_event_t* e) {
-  auto* self = static_cast<SnakeGame*>(lv_event_get_user_data(e));
+void WadaSnakeGame::startCb(lv_event_t* e) {
+  auto* self = static_cast<WadaSnakeGame*>(lv_event_get_user_data(e));
   if (self) self->startGame();
 }
-void SnakeGame::pauseCb(lv_event_t* e) {
-  auto* self = static_cast<SnakeGame*>(lv_event_get_user_data(e));
+void WadaSnakeGame::pauseCb(lv_event_t* e) {
+  auto* self = static_cast<WadaSnakeGame*>(lv_event_get_user_data(e));
   if (self) self->togglePause();
 }

@@ -1,9 +1,22 @@
+#if defined(WADA_MESHTASTIC)
+#include "WadaMeshtasticBackend.h"
+#include "WadaDeliveryUI.h"
+#include "WadaTelemetry.h"
+#include "WadaNodeState.h"
+#include "WadaStatus.h"
+#include "mesh/PositionPrecision.h"
+#endif
+#include "QrPopupLayout.h"
+// Shared network workers also serve the native protobuf backend.
+#if defined(WADA_MESHTASTIC) || defined(MULTI_TRANSPORT_COMPANION)
+#define WADA_NETWORK_UI 1
+#endif
 #include "UITask.h"
 #include "TouchSleep.h"
 #include "ChatHashtag.h"
 #include <climits>         // INT_MAX (glibc does not pull it in transitively, macOS/ESP-IDF do)
 
-#if defined(WADA_WEB)
+#if defined(WADA_MESHTASTIC) || defined(WADA_WEB)
   #include "WebMesh.h"     // web/mesh: the MyMesh stand-in (the UI's compile-time mesh contract)
 #else
   #include "../MyMesh.h"
@@ -44,7 +57,10 @@ static void* wadaMp3Scratch() { return s_wada_mp3_scratch; }
 #endif
 #if defined(ESP32)
   #include <time.h>
-  #include <SPIFFS.h>
+  #include <SPIFFS.h> // Keep the framework dependency visible to PlatformIO LDF.
+#if defined(WADA_MESHTASTIC)
+#include "WadaStorage.h"
+#endif
   // Dedicated LittleFS instance for the map tile pack (separate
   // partition — see variants/heltec_v4/partitions_tft_touch.csv). Keeps
   // tiles out of the SPIFFS partition where /new_prefs + /contacts3 +
@@ -72,17 +88,18 @@ static void* wadaMp3Scratch() { return s_wada_mp3_scratch; }
   #if !defined(HAS_TANMATSU)
   #include <esp_spi_flash.h>   // spi_flash_cache2phys — verify the OTA "running" slot matches reality (beta_21 coredump)
   #endif
-  #if !defined(HAS_TANMATSU)
+  #if !defined(HAS_TANMATSU) && !defined(WADA_MESHTASTIC)
   #include <esp_core_dump.h>   // detect/read/erase the panic coredump for the crash-report export
   #include <freertos/FreeRTOS.h>
   #include <freertos/task.h>   // xTaskGetCurrentTaskHandleForCPU / pcTaskGetName — Task-WDT crash self-record
   #include <freertos/queue.h>
   #else
-  // Tanmatsu's 16M.csv has no coredump partition yet — stub so the crash-export compiles + links.
+  // These partition layouts do not enable ESP-IDF flash coredumps.
+  // Return unsupported so crash-export controls stay unavailable.
   #include <esp_err.h>
-  static inline esp_err_t esp_core_dump_image_check() { return ESP_FAIL; }
-  static inline esp_err_t esp_core_dump_image_get(size_t* a, size_t* s) { (void)a; (void)s; return ESP_FAIL; }
-  static inline esp_err_t esp_core_dump_image_erase() { return ESP_FAIL; }
+  static inline esp_err_t esp_core_dump_image_check() { return ESP_ERR_NOT_SUPPORTED; }
+  static inline esp_err_t esp_core_dump_image_get(size_t* a, size_t* s) { (void)a; (void)s; return ESP_ERR_NOT_SUPPORTED; }
+  static inline esp_err_t esp_core_dump_image_erase() { return ESP_ERR_NOT_SUPPORTED; }
   #endif
 #endif
 #if defined(HAS_CROWPANEL_35)
@@ -94,7 +111,11 @@ static void* wadaMp3Scratch() { return s_wada_mp3_scratch; }
   extern SPIClass* tdeckSharedSPI();
   // FatFs mkfs (the prebuilt ESP-IDF compiles f_setlabel OUT — FF_USE_LABEL=0 —
   // so the "MESHCOMOD" volume label is written by hand via sd_*_raw, below).
+  #if defined(WADA_MESHTASTIC)
+  #include "ff.h"
+  #else
   extern "C" int f_mkfs(const char* path, uint8_t opt, uint32_t au, void* work, unsigned len);
+  #endif
   #ifndef MC_FM_FAT32
     #define MC_FM_FAT32 0x02  // FatFs f_mkfs option: force FAT32
   #endif
@@ -287,8 +308,10 @@ static_assert(ChannelSenderSplit::kMaxWireName >= (size_t)UITask::MAX_SENDER_NAM
     #endif
     #include "../helpers/ClockFloorRTC.h"
     extern ClockFloorRTC rtc_clock;   // the board clock (variants/*/target.cpp); its send-timestamp floor is seeded/persisted from here (#89)
-    #if defined(MULTI_TRANSPORT_COMPANION)
+    #if defined(WADA_NETWORK_UI)
+      #if !defined(WADA_MESHTASTIC)
       #include "../helpers/esp32/MultiTransportCompanionInterface.h"   // bleLastFailReason()
+      #endif
       #include <WiFi.h>
       #include <HTTPClient.h>
       #include <WiFiClientSecure.h>   // on-device HTTPS for the Reader (text browser); setInsecure(), no cert store
@@ -296,7 +319,9 @@ static_assert(ChannelSenderSplit::kMaxWireName >= (size_t)UITask::MAX_SENDER_NAM
         #include <Update.h>   // Arduino OTA writer (native dual-OTA boards; Tanmatsu is IDF/AppFS, no OTA)
       #endif
       #include "../helpers/esp32/WifiRuntimeStore.h"   // QUOTED: this tree's copy (wifiScan*Active), not the lib's stale one
+      #if !defined(WADA_MESHTASTIC)
       #include "helpers/esp32/MqttBridge.h"
+      #endif
       #if defined(HAS_TDISPLAY_P4) && !TDP4_C6_HOSTED
         // T-Display P4: the C6 runs ESP-AT, so Arduino's real WiFi object must NEVER be driven (its
         // mode()/begin() re-init esp_hosted and panic). These facades rebind every WiFi.* below to the
@@ -351,11 +376,16 @@ constexpr uint32_t k_ui_history_magic = 0x55494348; // "UICH"
 // APPEND fields to the END of UiHistoryThread/UiHistoryMsg and OLD blobs still
 // load — the appended tail reads back zero instead of the whole history being
 // discarded. v4 added meta_flags/path_len/snr_q4/rssi per message.
-constexpr uint16_t k_ui_history_version = 6;   // v6: MAX_MSG_TEXT 96 -> 160 (record size changed)
+#if defined(WADA_MESHTASTIC)
+constexpr uint16_t k_ui_history_version = 7;   // v6: MAX_MSG_TEXT 96 -> 160 (record size changed)
 // Oldest on-disk version we still load. v4's record layout matches the current
 // build, so it reads fine via the sizeof() fallback below; anything older
 // predates that layout and is discarded.
-constexpr uint16_t k_ui_history_min_version = 6;   // v4/v5 used 96-char records; reject (don't mis-read)
+constexpr uint16_t k_ui_history_min_version = 7;   // v4/v5 used 96-char records; reject (don't mis-read)
+#else
+constexpr uint16_t k_ui_history_version = 6;
+constexpr uint16_t k_ui_history_min_version = 6;
+#endif
 
 // Split-format file paths. Thread metadata and the message ring are written
 // to separate files so unread counts (small, ~4 KB) can flush at 200 ms while
@@ -448,6 +478,10 @@ struct __attribute__((packed)) UiHistoryMsg {
   char thread[UITask::MAX_THREAD_NAME + 1];
   char sender[k_ui_disk_sender_len];
   char text[UITask::MAX_MSG_TEXT + 1];
+  #if defined(WADA_MESHTASTIC)
+  uint32_t ack_hash;
+  uint8_t deliv_state;
+  #endif
   // Append any FUTURE fields HERE (after text) and bump k_ui_history_version.
   // The v5+ loader zero-fills appended fields for older blobs, so appending
   // never wipes chat history. Inserting in the middle (as v4 did) breaks that
@@ -490,7 +524,11 @@ constexpr const char* k_ui_seg_dir     = "/msgs";
 // oldest-first PREFIX that shadowed the old file forever: the UI came up
 // showing only the oldest few hundred messages, permanently.
 constexpr const char* k_ui_seg_ok      = "/msgs/store.ok";
+#if defined(WADA_MESHTASTIC)
+constexpr uint32_t    k_ui_seg_magic   = 0x574D5347;   // "WMSG"
+#else
 constexpr uint32_t    k_ui_seg_magic   = 0x55495347;   // "UISG"
+#endif
 constexpr uint16_t    k_ui_seg_version = 1;
 constexpr int         k_ui_seg_records = 256;          // records per segment (~60 KB at v1 size)
 // Segment files: merging keeps the count at k_ui_seg_soft (24, what every older
@@ -534,16 +572,29 @@ struct __attribute__((packed)) UiSegMsg {
   // the file instead. Our own direction of the same hazard IS handled: see the width
   // check in loadMsgsFromSegments, which refuses to append across widths.
   char         sender_ext[UITask::MAX_SENDER_NAME + 1 - k_ui_disk_sender_len];
+  #if defined(WADA_MESHTASTIC)
+  uint8_t      native_channel_identity[32];
+  uint8_t      native_conversation_id[6];
+  #endif
 };
 
 // Pin what an ALREADY-WRITTEN record's reader depends on. These are offsets, not the total
 // size, precisely because appending further fields at the tail stays safe — what must never
 // move is anything a v6-era record already holds, since nothing on the read path would
 // detect the shift. Growing the record past these offsets is fine; moving them is not.
-static_assert(sizeof(UiHistoryMsg) == 229, "v6 record layout changed — old blobs would mis-read");
-static_assert(offsetof(UiSegMsg, seq) == 229, "seq moved — old segments would mis-read");
-static_assert(offsetof(UiSegMsg, sender_ext) == 233,
+#if defined(WADA_MESHTASTIC)
+static_assert(sizeof(UiHistoryMsg) == 307, "v6 record layout changed — old blobs would mis-read");
+static_assert(offsetof(UiSegMsg, seq) == 307, "seq moved — old segments would mis-read");
+static_assert(offsetof(UiSegMsg, sender_ext) == 311,
               "the appended tail must start where the old record ended, or old segments mis-read");
+static_assert(offsetof(UiSegMsg, native_channel_identity) == offsetof(UiSegMsg, sender_ext) + sizeof(UiSegMsg::sender_ext) &&
+              offsetof(UiSegMsg, native_conversation_id) == offsetof(UiSegMsg, native_channel_identity) + 32 &&
+              sizeof(UiSegMsg) == offsetof(UiSegMsg, native_conversation_id) + 6, "Native channel identity tail moved");
+#else
+static_assert(sizeof(UiHistoryMsg) == 229, "MeshCore history record layout changed");
+static_assert(offsetof(UiSegMsg, seq) == 229, "MeshCore history sequence moved");
+static_assert(offsetof(UiSegMsg, sender_ext) == 233, "MeshCore history sender tail moved");
+#endif
 } // namespace
 #endif
 
@@ -1844,7 +1895,7 @@ static void initTouchFontFallbacks() {
   g_font_badge.fallback = &g_font_12;
 }
 
-#if defined(MULTI_TRANSPORT_COMPANION)
+#if defined(WADA_NETWORK_UI)
 // Cross-core queued + in-flight tile count. This drives progress/memory gates;
 // backend ownership is tracked separately beside s_tile_fs so a queued backlog
 // does not unnecessarily delay a safe cache handoff.
@@ -2805,7 +2856,7 @@ void reserveTileFetchStack();   // fwd: claim the worker stack before Wi-Fi eats
 
 // ---- AppPage: the shared full-screen app-page chrome (see AppPage.h) --------------
 // Thin wrappers over the machinery just above, exported so the self-contained app
-// modules (SnakeGame) build the same page as the in-file tool
+// modules (WadaSnakeGame) build the same page as the in-file tool
 // pages instead of hand-rolling it against a hardcoded bar height.
 lv_coord_t appPageContentTop() {
 #if defined(HELTEC_LORA_V4_R8)
@@ -3423,6 +3474,9 @@ struct LvChatPanel {
   /** When true, `list_cont` shows channels + DMs with history (Chats tab only). */
   bool inbox_combined;
   bool detail_open;
+#if defined(WADA_MESHTASTIC)
+  bool follow_own_send = false;
+#endif
   uint32_t list_sig = 0;   // change-signature of the rendered thread list (skip no-op rebuilds)
 };
 
@@ -3995,6 +4049,18 @@ static size_t arabicUnshape(const char* in, char* out, size_t cap) {
   return o;
 }
 
+#if defined(WADA_MESHTASTIC)
+static bool wadaNormalizeMessage(const char* text, char* out, size_t capacity, bool single_line) {
+  if (!wada::statusText(text, 511, single_line)) return false;
+  char normalized[512];
+  arabicUnshape(text, normalized, sizeof(normalized));
+  const size_t length = strlen(normalized);
+  if (!wada::statusText(normalized, MAX_TEXT_LEN, single_line) || length >= capacity) return false;
+  memcpy(out, normalized, length + 1);
+  return true;
+}
+#endif
+
 // Remove discovered entries heard via more hops than the configured limit (the
 // "auto-delete above N hops" setting; 0 = off). Returns true if anything went.
 static bool discoveredSweepHops() {
@@ -4432,6 +4498,9 @@ enum class SettingsModalKind : uint8_t {
   QuickReply,   // Edit the 6 quick-reply preset macros
   Mqtt,         // MQTT bridge config
   BleKeyboard,  // pair an external Bluetooth keyboard
+  NativeTelemetry,
+  NativeSecurity,
+  NativeNodeDetails,
 };
 
 struct SettingsModalState {
@@ -6782,7 +6851,7 @@ static void navSliderNudge(lv_obj_t* s, int dir) {
   lv_event_send(s, LV_EVENT_VALUE_CHANGED, nullptr);
 }
 
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
 static bool readerNavMove(lv_obj_t* cur, int dir);   // the Web page's Up/Down (with the Reader below)
 #endif
 // System Information and Memory detail are read-only: their only focus target is
@@ -6914,7 +6983,7 @@ static bool navMoveDir(int dir) {
 #if defined(HAS_THINKNODE_M9)
   if (m9ControlCenterMove(cur, dir)) return false;
 #endif
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
   if (readerNavMove(cur, dir)) return true;
 #endif
   // Rank laid-out geometry. Objects created since the last display refresh (a chat's
@@ -8671,6 +8740,9 @@ static bool chatVirtAwayFromBottom(LvChatPanel* p);
 static void refreshChatList(LvChatPanel& p);
 static void applyAccent(uint32_t rgb);            // theme accent (Settings -> Accent colour)
 static void openAccentPicker();
+static void wadaNodeDetails();
+static void wadaExchangeUserInfo();
+static bool wadaSelectThreadNode(int index);
 static void openChannelScopeModal(int slot, const char* name);  // per-channel region scope
 static void channelGearCb(lv_event_t* e);
 static bool chanScopeIsOpen();   // fwd: the status-bar back chevron closes the channel-settings sheet
@@ -8812,7 +8884,9 @@ enum {
   CAT_DEVICE = 0,    // model + detected hardware + overrides, then firmware / update /
                      // system info / diagnostics (was "About", at the bottom; #596)
   CAT_PROFILE,       // identity / name / advert location / QR / export-import
-  CAT_RADIO,         // radio params + experimental
+  CAT_RADIO,         // native LoRa settings
+  CAT_CHANNELS,
+  CAT_NODEINFO,
   CAT_AUTOADD,       // Contact Management: auto-add + old-contact removal (own page; also linked from the Contacts tab)
   CAT_WIFI,          // Wi-Fi config + saved slots
   CAT_BLUETOOTH,     // BLE enable + pairing code
@@ -8850,8 +8924,17 @@ enum {
 static const SettingsCatDef kSettingsCats[CAT_COUNT] = {
   { "Device",        UI_ICON_INFO },
   { "Profile",       UI_ICON_USER },
-  { "Radio & Mesh",  UI_ICON_RADIO_TOWER },
+  #if defined(WADA_MESHTASTIC)
+  { "LoRa", UI_ICON_RADIO_TOWER },
+  { "Channels", UI_ICON_HASH },
+  { "Node info & broadcasts", UI_ICON_RADIO_TOWER },
+  { "Nodes", UI_ICON_USERS },
+  #else
+  { "Radio & Mesh", UI_ICON_RADIO_TOWER },
+  { "Channels", UI_ICON_HASH },
+  { "Node info & broadcasts", UI_ICON_RADIO_TOWER },
   { "Contact Management", UI_ICON_USER_PLUS },
+  #endif
   { "Wi-Fi",         UI_ICON_WIFI },
   { "Bluetooth",     UI_ICON_BLUETOOTH },
   { "GPS",           UI_ICON_SATELLITE },
@@ -8869,7 +8952,11 @@ static const SettingsCatDef kSettingsCats[CAT_COUNT] = {
   { "Quick replies", UI_ICON_REPLY },
   { "Lock screen",   UI_ICON_LOCK },
   { "General",       UI_ICON_SETTINGS },
-  { "Backups",       UI_ICON_HISTORY },
+#if defined(WADA_MESHTASTIC)
+  { "Storage & reset", UI_ICON_HISTORY },
+#else
+  { "Backups", UI_ICON_HISTORY },
+#endif
   { "Language",      UI_ICON_LANGUAGES },
   { "MQTT bridge",   UI_ICON_SHARE_2 },
   { "App permissions", UI_ICON_SHIELD_CHECK },
@@ -9208,7 +9295,7 @@ static volatile bool s_sdinfo_ok       = false;  // card present + sizes valid
 static uint64_t      s_sdinfo_tot      = 0;
 static uint64_t      s_sdinfo_free     = 0;
 static volatile int  s_verchk_latest_n = -1;     // highest published pre-alpha_N (-1 = failed)
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION) && CAP_OTA
+#if defined(ESP32) && defined(WADA_NETWORK_UI) && CAP_OTA
 // Wi-Fi OTA self-update — native dual-OTA boards only (V4 + standalone T-Deck). The button is
 // gated on touchHasOtaUpdateSlot() (a spare A/B slot exists), so Launcher single-slot installs and
 // the Tanmatsu (AppFS) never reach this — they update out-of-band. Arduino Update.begin() does the
@@ -9367,7 +9454,7 @@ static void otaButtonRefreshState() {
   }
 }
 
-#if CAP_SD && defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION) && CAP_OTA
+#if CAP_SD && defined(ESP32) && defined(WADA_NETWORK_UI) && CAP_OTA
 // ---- Save-update-to-SD (Launcher installs) ---------------------------------
 // Launcher-managed T-Decks have no spare A/B slot (touchHasOtaUpdateSlot() is
 // false), so Wi-Fi OTA can't work there — but the Launcher itself can flash an
@@ -9443,7 +9530,7 @@ static void sdFwSaveToSdCb(lv_event_t* e) {
 }
 #endif
 
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION) && CAP_OTA
+#if defined(ESP32) && defined(WADA_NETWORK_UI) && CAP_OTA
 static lv_timer_t* s_ota_poll_timer = nullptr;
 // UI-thread poll of the worker's OTA progress (the download/flash runs on the tile worker).
 static void otaPollTimerCb(lv_timer_t* t) {
@@ -9616,6 +9703,7 @@ struct ActItem {
   const char* label;     // already translated
   void (*fn)();          // run after the sheet closes
   bool danger;
+  lv_obj_t* (*glyph)(lv_obj_t*) = nullptr;
 };
 static lv_obj_t* s_actlist_root = nullptr;
 static ActItem   s_actlist_items[16];
@@ -9733,7 +9821,10 @@ static void openActionList(const char* title, const ActItem* items, int n) {
       lv_obj_set_style_bg_opa(hl, LV_OPA_COVER, LV_PART_MAIN);
     }
     lv_coord_t tx = 16;
-    if (it.icon) {
+    if (it.glyph) {
+      lv_obj_align(it.glyph(r), LV_ALIGN_LEFT_MID, 16, 0);
+      tx = 16 + SC(28);
+    } else if (it.icon) {
       lv_obj_t* ic = lv_label_create(r);
       lv_label_set_text(ic, it.icon);
       lv_obj_set_style_text_font(ic, &g_font_16, LV_PART_MAIN);
@@ -9768,7 +9859,7 @@ static void openActionList(const char* title, const ActItem* items, int n) {
 
 static void otaInstallLatestCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION) && CAP_OTA
+#if defined(ESP32) && defined(WADA_NETWORK_UI) && CAP_OTA
   otaStartInstall(s_verchk_latest_n);
 #else
   // Launcher / Tanmatsu: no spare OTA slot to write into — update out-of-band.
@@ -9801,7 +9892,7 @@ static void versionCheckService(unsigned long now) {
     return;
   }
 #endif
-#if defined(MULTI_TRANSPORT_COMPANION)
+#if defined(WADA_NETWORK_UI)
   if (firmwareReleaseN() < 0) return;   // dev build: nothing to compare against
   storeUpdatesPoll();
   static bool started = false;
@@ -9870,7 +9961,7 @@ static void versionCheckService(unsigned long now) {
   (void)now;
 #endif
 }
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
 // "Get test builds (beta)" toggle (About page) — switch the OTA update channel
 // between stable (releases/TOUCH) and the opt-in test/beta channel (releases/BETA).
 // Persists the choice, then forces a fresh version check so the About status line
@@ -9893,7 +9984,7 @@ static void applySwipeGesture(int8_t swipe_x, int8_t swipe_y) {
   // centre behind the overlay. This reuses the per-board hardware swipe detector
   // that drives tab switching (reliable on both the V4 cap-touch and the T-Deck
   // GT911), since LVGL's own LV_EVENT_GESTURE doesn't fire dependably on the
-  // cap-touch — so this, not SnakeGame's gestureCb, is what makes touch steering
+  // cap-touch — so this, not WadaSnakeGame's gestureCb, is what makes touch steering
   // actually work. swipe_x<0 == left, swipe_y<0 == up (see the control-center
   // note below for the sign convention).
   if (luaAppIsOpen()) {   // Lua apps get the same reliable hardware swipes as Snake did
@@ -9901,9 +9992,9 @@ static void applySwipeGesture(int8_t swipe_x, int8_t swipe_y) {
     else if (swipe_y != 0) luaAppSteer(0, swipe_y < 0 ? -1 : 1);
     return;
   }
-  if (SnakeGame::isOpen()) {
-    if (swipe_x != 0)      SnakeGame::steer(swipe_x < 0 ? -1 : 1, 0);
-    else if (swipe_y != 0) SnakeGame::steer(0, swipe_y < 0 ? -1 : 1);
+  if (WadaSnakeGame::isOpen()) {
+    if (swipe_x != 0)      WadaSnakeGame::steer(swipe_x < 0 ? -1 : 1, 0);
+    else if (swipe_y != 0) WadaSnakeGame::steer(0, swipe_y < 0 ? -1 : 1);
     return;
   }
   // Every OTHER full-screen app page (Airtime, Spectrum, RF Monitor, Discover, VNC, Remote,
@@ -11523,6 +11614,44 @@ static void channelShareCopyCb(lv_event_t* e) {
   clipboardSet(s_channel_share_secret_hex, "secret");
 }
 
+static void openUrlQrPopup(const char* url);
+#if defined(WADA_MESHTASTIC)
+static unsigned wadaShareSlot = 0;
+static uint8_t wadaShareIdentity[32]{};
+static void wadaShowChannelQr(bool add) {
+  uint8_t identity[32];
+  char url[1024];
+  if (wadaBackend && wadaBackend->channelIdentity(wadaShareSlot, identity) &&
+      !memcmp(identity, wadaShareIdentity, 32) && wadaBackend->channelUrl(wadaShareSlot, url, sizeof(url), add))
+    openUrlQrPopup(url);
+  else if (g_lv.task) g_lv.task->showAlert(TR("Channel configuration changed. Open sharing again."), 2200);
+}
+static void wadaChooseChannelQr(unsigned slot) {
+  if (!wadaBackend || !wadaBackend->channelIdentity(slot, wadaShareIdentity)) return;
+  wadaShareSlot = slot;
+  const ActItem choices[] = {
+    { UI_ICON_REFRESH_CW, TR("Replace configuration QR"), [] {
+      showConfirm(TR("Contains primary and selected channel keys. Import replaces channels and LoRa settings."),
+                  TR("Show QR"), [] { wadaShowChannelQr(false); });
+    }, false },
+    { UI_ICON_PLUS, TR("Add channel QR"), [] { wadaShowChannelQr(true); }, false },
+  };
+  openActionList(TR("Share channel"), choices, 2);
+}
+static void openChannelShareModal(const char* channel_name, const uint8_t secret[16]) {
+  ChannelDetails channel{};
+  for (unsigned slot = 0; slot < 8; ++slot) {
+    if (the_mesh.getChannel(slot, channel) && channel.name[0] && channel_name &&
+        !strcmp(channel.name, channel_name) && !memcmp(channel.channel.secret, secret, 16) && wadaBackend &&
+        wadaBackend->channelIdentity(slot, wadaShareIdentity)) {
+      wadaChooseChannelQr(slot);
+      return;
+    }
+  }
+  if (g_lv.task) g_lv.task->showAlert(TR("Channel configuration is unavailable"), 1800);
+}
+
+#else
 static void openChannelShareModal(const char* channel_name, const uint8_t secret[16]) {
   // Render hex once and stash it for the Copy button.
   for (int i = 0; i < 16; ++i) {
@@ -11580,6 +11709,7 @@ static void openChannelShareModal(const char* channel_name, const uint8_t secret
   lv_label_set_text(bl, TR("Copy secret"));
   lv_obj_center(bl);
 }
+#endif
 
 // Per-channel long-press sheet: [Share secret] [Remove channel] [Cancel].
 static lv_obj_t* s_channel_long_sheet = nullptr;
@@ -11600,6 +11730,10 @@ static void channelLongSheetShareDo() {
   const int t = s_channel_long_idx;
   closeChannelLongSheet();
   if (t < 0 || !g_lv.task) return;
+  if (!g_lv.task->channelThreadAvailable(t)) {
+    g_lv.task->showAlert(TR("Archived channel. Open Settings to choose an active channel."), 2600);
+    return;
+  }
   bool ch; uint16_t unread; uint32_t ts;
   char tname[UITask::MAX_THREAD_NAME + 1];
   if (!g_lv.task->getThreadInfo(t, ch, unread, ts, tname, sizeof(tname)) || !ch) return;
@@ -11624,7 +11758,16 @@ static void channelLongSheetDeleteDo() {
   bool ch; uint16_t unread; uint32_t ts;
   char tname[UITask::MAX_THREAD_NAME + 1];
   if (!g_lv.task->getThreadInfo(s_chat_del_thread_idx, ch, unread, ts, tname, sizeof(tname))) return;
-  char msg[80];
+  char msg[180];
+#if defined(WADA_MESHTASTIC)
+  if (g_lv.task->channelThreadAvailable(s_chat_del_thread_idx)) {
+    openChannelScopeModal(g_lv.task->threadMeshChannelSlot(s_chat_del_thread_idx), tname);
+    return;
+  }
+  snprintf(msg, sizeof(msg), TR("Delete archived chat %s and its history on this display?"), tname);
+  showConfirm(msg, TR("Delete"), chatDeleteApply);
+  return;
+#endif
   snprintf(msg, sizeof(msg),
            TR("Remove channel \"%s\"?\nLeaves it on this device only."), tname);
   showConfirm(msg, TR("Remove"), chatDeleteApply);
@@ -11707,6 +11850,10 @@ static void channelLongSheetRegionDo() {
   const int t = s_channel_long_idx;
   closeChannelLongSheet();
   if (t < 0 || !g_lv.task) return;
+  if (!g_lv.task->channelThreadAvailable(t)) {
+    g_lv.task->showAlert(TR("Archived channel. Open Settings to choose an active channel."), 2600);
+    return;
+  }
   bool ch; uint16_t un; uint32_t ts; char tname[UITask::MAX_THREAD_NAME + 1] = "";
   if (!g_lv.task->getThreadInfo(t, ch, un, ts, tname, sizeof(tname)) || !ch) return;
 #ifdef MAX_GROUP_CHANNELS
@@ -11860,6 +12007,7 @@ static void threadSheetIconResetCb(lv_event_t* e) {
 static void openThreadActionSheet(int thread_idx, const char* name, bool is_channel) {
   closeChannelLongSheet();
   s_channel_long_idx = thread_idx;
+  const bool channel_available = !is_channel || (g_lv.task && g_lv.task->channelThreadAvailable(thread_idx));
   // Room-server thread? Adds the "Log in again" row (issue #89 session recovery).
   bool is_room_thread = false;
   if (!is_channel && g_lv.task) {
@@ -11886,27 +12034,34 @@ static void openThreadActionSheet(int thread_idx, const char* name, bool is_chan
     items[n++] = { LV_SYMBOL_OK, TR("Mark as read"), threadSheetMarkReadDo, false };
     if (is_channel) {
       const uint8_t mute = touchPrefsGetChannelMute(name ? name : "");
-      items[n++] = { LV_SYMBOL_SETTINGS, TR("Region & scope"), channelLongSheetRegionDo, false };
+      if (channel_available) items[n++] = { LV_SYMBOL_SETTINGS, TR("Channel settings"), channelLongSheetRegionDo, false };
       items[n++] = { (mute & TOUCH_CHMUTE_MSG) ? LV_SYMBOL_AUDIO : LV_SYMBOL_MUTE,
                      (mute & TOUCH_CHMUTE_MSG) ? TR("Unmute messages") : TR("Mute messages"),
                      []{ channelMuteToggle(TOUCH_CHMUTE_MSG); }, false };
       items[n++] = { (mute & TOUCH_CHMUTE_MEN) ? LV_SYMBOL_AUDIO : LV_SYMBOL_MUTE,
                      (mute & TOUCH_CHMUTE_MEN) ? TR("Unmute mentions") : TR("Mute mentions"),
                      []{ channelMuteToggle(TOUCH_CHMUTE_MEN); }, false };
-      items[n++] = { LV_SYMBOL_SHUFFLE, TR("Share secret"), channelLongSheetShareDo, false };
+      if (channel_available) items[n++] = { LV_SYMBOL_SHUFFLE, TR("Share channel QR"), channelLongSheetShareDo, false };
     } else {
+#if defined(WADA_MESHTASTIC)
+      items[n++] = { UI_ICON_INFO, TR("Node details"), [] { if (wadaSelectThreadNode(s_channel_long_idx)) wadaNodeDetails(); }, false };
+      items[n++] = { UI_ICON_REFRESH_CW, TR("Exchange user info"), [] { if (wadaSelectThreadNode(s_channel_long_idx)) wadaExchangeUserInfo(); }, false };
+#endif
       if (is_room_thread) {
         items[n++] = { LV_SYMBOL_REFRESH, TR("Log in again"), threadSheetRoomLoginDo, false };
         items[n++] = { LV_SYMBOL_LOOP, TR("Join w/ password"), threadSheetRoomJoinDo, false };
       }
+#if !defined(WADA_MESHTASTIC)
       items[n++] = { LV_SYMBOL_LOOP, TR("Reset path"), threadSheetResetPathDo, false };
+#endif
     }
     items[n++] = { LV_SYMBOL_CLOSE, TR("Blocked users"), channelLongSheetBlockedDo, false };
     items[n++] = { LV_SYMBOL_IMAGE, TR("Chat icon"), threadSheetIconDo, false };
     if (has_icon) items[n++] = { LV_SYMBOL_REFRESH, TR("Reset chat icon"), threadSheetIconResetDo, false };
     items[n++] = { LV_SYMBOL_TRASH, TR("Delete history"), threadSheetClearHistDo, false };
-    items[n++] = is_channel ? ActItem{ LV_SYMBOL_TRASH, TR("Remove channel"), channelLongSheetDeleteDo, true }
-                            : ActItem{ LV_SYMBOL_TRASH, TR("Delete chat"), threadSheetDeleteDmDo, true };
+    if (!is_channel || !channel_available)
+      items[n++] = is_channel ? ActItem{ LV_SYMBOL_TRASH, channel_available ? TR("Remove channel") : TR("Delete archived chat"), channelLongSheetDeleteDo, true }
+                              : ActItem{ LV_SYMBOL_TRASH, TR("Delete chat"), threadSheetDeleteDmDo, true };
     openActionList(s_title, items, n);
     return;
   }
@@ -12056,12 +12211,12 @@ static void openThreadActionSheet(int thread_idx, const char* name, bool is_chan
   };
   mk(TR(LV_SYMBOL_OK "  Mark as read"), threadSheetMarkReadCb, 0);
   if (is_channel) {
-    mk(TR(LV_SYMBOL_SETTINGS "  Region & scope"), channelLongSheetRegionCb, 0);
+    mk(TR(LV_SYMBOL_SETTINGS "  Channel settings"), channelLongSheetRegionCb, 0);
     // The two mutes sit side by side on their own row; labels set by chmuteRefreshLabels().
     s_chmute_msg_btn = mk("", channelMuteMsgCb, 0);
     s_chmute_men_btn = mk("", channelMuteMenCb, 0);
     chmuteRefreshLabels();
-    mk(TR(LV_SYMBOL_SHUFFLE  "  Share secret"),   channelLongSheetShareCb,   0);
+    mk(TR(LV_SYMBOL_SHUFFLE  "  Share channel QR"),   channelLongSheetShareCb,   0);
     mk(TR(LV_SYMBOL_CLOSE    "  Blocked users"),  channelLongSheetBlockedCb, 0);
     // Avatar emoji: tap = pick, long-press = back to the generated glyph.
     lv_obj_t* icb = mk(TR(LV_SYMBOL_IMAGE "  Chat icon"), threadSheetIconCb, 0);
@@ -12073,7 +12228,9 @@ static void openThreadActionSheet(int thread_idx, const char* name, bool is_chan
       mk(TR(LV_SYMBOL_REFRESH "  Log in again"),  threadSheetRoomLoginCb,    0);
       mk(TR(LV_SYMBOL_LOOP    "  Join w/ password"), threadSheetRoomJoinCb,  0);
     }
+#if !defined(WADA_MESHTASTIC)
     mk(TR(LV_SYMBOL_LOOP     "  Reset path"),     threadSheetResetPathCb,    0);
+#endif
     mk(TR(LV_SYMBOL_CLOSE    "  Blocked users"),  channelLongSheetBlockedCb, 0);
     lv_obj_t* icb = mk(TR(LV_SYMBOL_IMAGE "  Chat icon"), threadSheetIconCb, 0);
     if (icb) lv_obj_add_event_cb(icb, threadSheetIconResetCb, LV_EVENT_LONG_PRESSED, nullptr);
@@ -12104,6 +12261,9 @@ static void chatDeleteApply() {
       // channel-send stale-slot bug). Truncation-tolerant compare: the thread
       // name is capped at MAX_THREAD_NAME, so match only that many chars.
       const int16_t pinned = g_lv.task->threadMeshChannelSlot(idx);
+#if defined(WADA_MESHTASTIC)
+      if (g_lv.task->channelThreadAvailable(idx)) channel_slot = pinned;
+#else
       if (pinned >= 0 && pinned < MAX_GROUP_CHANNELS &&
           the_mesh.getChannel(pinned, cd) && cd.name[0] &&
           strncmp(cd.name, name, UITask::MAX_THREAD_NAME) == 0) {
@@ -12117,6 +12277,7 @@ static void chatDeleteApply() {
           }
         }
       }
+#endif
 #endif
     }
   }
@@ -12238,6 +12399,14 @@ static void composerSendFromPanel(LvChatPanel* p) {
   if (!g_lv.task || !p || !p->composer_ta) return;
   const char* text = lv_textarea_get_text(p->composer_ta);
   if (!text || !text[0]) return;
+#if defined(WADA_MESHTASTIC)
+  char normalized[UITask::MAX_MSG_TEXT + 1];
+  if (!wadaNormalizeMessage(text, normalized, sizeof(normalized), false)) {
+    g_lv.task->showAlert(TR("Message is too long or invalid UTF-8; nothing was sent"), 3000);
+    return;
+  }
+  text = normalized;
+#endif
   g_lv.task->setComposerMode(true);
   g_lv.task->composerReset();
   for (const char* cp = text; *cp; ++cp) g_lv.task->composerAppendChar(*cp);
@@ -12262,6 +12431,14 @@ static void sendFromPanelCb(lv_event_t* e) {
   if (!p || !p->composer_ta) return;
   const char* text = lv_textarea_get_text(p->composer_ta);
   if (!text || !text[0]) return;
+#if defined(WADA_MESHTASTIC)
+  char normalized[UITask::MAX_MSG_TEXT + 1];
+  if (!wadaNormalizeMessage(text, normalized, sizeof(normalized), false)) {
+    g_lv.task->showAlert(TR("Message is too long or invalid UTF-8; nothing was sent"), 3000);
+    return;
+  }
+  text = normalized;
+#endif
   g_lv.task->setComposerMode(true);
   g_lv.task->composerReset();
   for (const char* cp = text; *cp; ++cp) g_lv.task->composerAppendChar(*cp);
@@ -13237,7 +13414,7 @@ static void toggleTcpCb(lv_event_t* e) {
 }
 
 static bool bleEnableWaitingForWifi() {
-#if defined(TLORA_PAGER) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(TLORA_PAGER) && defined(WADA_NETWORK_UI)
   return wifiConfigPagerWifiBlocksBle();
 #else
   return false;
@@ -13266,7 +13443,7 @@ static const char* bleEnableFailureText() {
 // dead, and turn the first tap into "clear my preference" instead of "start it".
 static bool bleRequestedOrEnabled() {
   bool requested = g_lv.task && g_lv.task->isBleEnabled();
-#if defined(TLORA_PAGER) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(TLORA_PAGER) && defined(WADA_NETWORK_UI)
   requested = requested || wifiConfigGetBleEnabled();
 #endif
   return requested;
@@ -14300,11 +14477,14 @@ static lv_obj_t* createSettingsModal(const char* title, SettingsModalKind kind) 
   // compact X: the whole page is text to scroll through, and "Close" read as one
   // more item in it.
   const bool info_page = (kind == SettingsModalKind::SystemInfo ||
-                          kind == SettingsModalKind::MemoryInfo);
+                          kind == SettingsModalKind::MemoryInfo || kind == SettingsModalKind::NativeNodeDetails ||
+                          kind == SettingsModalKind::NativeSecurity || kind == SettingsModalKind::NativeTelemetry);
   lv_obj_t* close_btn = lv_btn_create(header);
   lv_obj_set_size(close_btn, info_page ? SC(32) : settingsModalCloseW(), SC(32));
   lv_obj_align(close_btn, LV_ALIGN_RIGHT_MID, -6, 0);
   styleButton(close_btn);
+  lv_obj_set_style_pad_left(close_btn, SC(4), LV_PART_MAIN);
+  lv_obj_set_style_pad_right(close_btn, SC(4), LV_PART_MAIN);
   lv_obj_add_event_cb(close_btn, settingsCloseCb, LV_EVENT_CLICKED, nullptr);
   lv_obj_t* close_lbl = lv_label_create(close_btn);
   useChainedFont(close_lbl);
@@ -14581,7 +14761,7 @@ void (*g_sntp_resync_hook)() = nullptr;
 static void syncClockCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
   const bool ok = g_lv.task->setDeviceTimeFromSystemClock();
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
   // On most boards the "system" clock IS the device clock, so the copy above changes
   // nothing unless SNTP had already moved it. With Wi-Fi up, ask the time server now
   // instead; the Wi-Fi loop writes the answer through (RTC chip included) and says
@@ -14607,10 +14787,17 @@ static uint16_t       s_hist_cap_pending = 0;
 
 static const uint8_t k_hist_sync_opts[] = { 0, 1, 2, 3, 5, 8 };
 
+#if defined(WADA_MESHTASTIC)
+static void advertNowCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
+  g_lv.task->showAlert(wadaBackend->sendNodeInfo(false,false) ? TR("Node info queued") : TR("Could not queue node info"), 900);
+}
+#else
 static void advertNowCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
   g_lv.task->showAlert(g_lv.task->sendAdvertNow() ? TR("Advert sent") : TR("Advert failed"), 900);
 }
+#endif
 
 static void rebootCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
@@ -14720,6 +14907,9 @@ static void advertHomeCb(lv_event_t* e) {
 #endif
 
 static void openAdvertPage() {
+#if defined(WADA_MESHTASTIC)
+  if(wadaBackend){openSettingsCategory(CAT_NODEINFO);return;}
+#endif
   closeAdvertPage();
   const lv_coord_t sw = lv_disp_get_hor_res(nullptr);
   const lv_coord_t sh = lv_disp_get_ver_res(nullptr);
@@ -15145,6 +15335,10 @@ static void openDiscoveredSettingsSheetCb(lv_event_t* e) {
 
 static void openDiscoveredModalCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+#if defined(WADA_MESHTASTIC)
+  openSettingsCategory(CAT_NODEINFO);
+  return;
+#endif
   lv_obj_t* body = createSettingsModal(TR("Discovered"), SettingsModalKind::Discovered);
   int y = 0;
 
@@ -15935,7 +16129,7 @@ static lv_obj_t* setNote(lv_obj_t* card, const char* text, uint8_t tone = SET_TO
   lv_obj_set_style_pad_column(box, SC(8), LV_PART_MAIN);
   lv_obj_t* il = lv_label_create(box);
   setIconLabel(il, tone == SET_TONE_INFO || tone == SET_TONE_OK ? UI_ICON_INFO : UI_ICON_CIRCLE_ALERT);
-  lv_obj_set_style_text_color(il, lv_color_hex(hue), LV_PART_MAIN);
+  lv_obj_set_style_text_color(il, lv_color_hex(tone == SET_TONE_WARN ? COLOR_STATUS_WARN_TEXT : hue), LV_PART_MAIN);
   lv_obj_t* l = lv_label_create(box);
   lv_obj_set_flex_grow(l, 1);
   lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
@@ -15945,6 +16139,88 @@ static lv_obj_t* setNote(lv_obj_t* card, const char* text, uint8_t tone = SET_TO
   return box;
 }
 
+#include "WadaStatusUI.inc"
+#include "WadaNativeNodes.inc"
+#if defined(WADA_MESHTASTIC)
+#include "WadaSettings.inc"
+#endif
+
+#if defined(WADA_MESHTASTIC)
+static void buildProfileSettings() {
+  if(wadaBackend){wadaBuildProfileSettings();return;}
+  // The name you go by on the mesh.
+  {
+    lv_obj_t* c = setCard("");
+    g_set_modal.name_ta = setField(c, "Node name", "Node name", 31);
+    lv_obj_add_event_cb(g_set_modal.name_ta, saveProfileNameCb, LV_EVENT_DEFOCUSED, nullptr);   // saves on blur
+    if (g_lv.task) {
+      char nm_vis[40];
+      const char* raw = g_lv.task->getNodeNameCstr();
+      copyUtf8ReplacingMissingGlyphs(&g_font_14, nm_vis, sizeof(nm_vis), raw ? raw : "");
+      lv_textarea_set_text(g_set_modal.name_ta, nm_vis);
+    }
+  }
+
+  // Where your adverts say you are, and whether they say it at all.
+  {
+    lv_obj_t* c = setCard("Advert location");
+    lv_obj_t* row = setFieldRow(c);
+    g_set_modal.lat_ta = setField(row, "Latitude", "Latitude", 20, setFieldW(2));
+    g_set_modal.lon_ta = setField(row, "Longitude", "Longitude", 20, setFieldW(2));
+    lv_obj_add_event_cb(g_set_modal.lat_ta, saveProfilePosCb, LV_EVENT_DEFOCUSED, nullptr);   // the pair saves on blur
+    lv_obj_add_event_cb(g_set_modal.lon_ta, saveProfilePosCb, LV_EVENT_DEFOCUSED, nullptr);
+    if (g_lv.task) {
+      char buf[24];
+      snprintf(buf, sizeof(buf), "%.6f", g_lv.task->getNodeLat());
+      lv_textarea_set_text(g_set_modal.lat_ta, buf);
+      snprintf(buf, sizeof(buf), "%.6f", g_lv.task->getNodeLon());
+      lv_textarea_set_text(g_set_modal.lon_ta, buf);
+    }
+    // With GPS on and a fix, updateGpsLocation() rewrites the position every loop,
+    // so a picked one would not stay: no row then.
+    if (!mapPickGpsOwnsPosition())
+      setActionRow(c, UI_ICON_MAP_PIN, "Pick on the map", nullptr, [](lv_event_t* e) {
+        if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+        lv_indev_t* a = lv_indev_get_act();
+        if (a) lv_indev_wait_release(a);
+        // Save a typed lat/lon first (the pair's blur save), so the map starts from it.
+        if (g_set_modal.lat_ta) lv_event_send(g_set_modal.lat_ta, LV_EVENT_DEFOCUSED, nullptr);
+        mapPickStart();   // closes this page with popupClose (deferred delete), so safe from its own tap
+      });
+    NodePrefs* pol = the_mesh.getNodePrefs();
+    g_set_modal.share_loc_sw = setSwitchRow(c, "Share location in advert",
+                                            "Adverts reach every node in range, unencrypted. GPS > Location privacy can shift the position they carry.",
+                                            pol && pol->advert_loc_policy, savePolicyCb);   // applies on toggle
+  }
+
+  // The identity behind the name: the public key, and the QR that hands it over. The
+  // private key never shows: it is library-private, and private material on a touch
+  // screen is a footgun.
+  {
+    lv_obj_t* c = setCard("Meshtastic identity");
+    char nodeId[32];snprintf(nodeId,sizeof(nodeId),"Node !%08x",wadaBackend->nodeNumber());setNote(c,nodeId);
+    const uint8_t* pk = wadaBackend->ownUser().public_key.bytes;
+    char pk_hex[2 * PUB_KEY_SIZE + 1];
+    for (int i = 0; i < (int)PUB_KEY_SIZE; ++i) snprintf(pk_hex + i * 2, 3, "%02x", pk[i]);
+    lv_obj_t* l = lv_label_create(c);
+    lv_obj_set_width(l, s_settings_content_w);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(l, pk_hex);
+    lv_obj_set_style_text_font(l, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l, lv_color_hex(COLOR_GLOW), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(l, lv_color_hex(COLOR_FIELD), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(l, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(l, SC(6), LV_PART_MAIN);
+    lv_obj_set_style_radius(l, SC(6), LV_PART_MAIN);
+    lv_obj_add_flag(l, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(l, copyLabelLongPressCb, LV_EVENT_LONG_PRESSED, const_cast<char*>("pubkey"));
+    setNote(c, "Hold the key to copy it.");
+    setActionRow(c, UI_ICON_QR_CODE, "Share QR", nullptr, [](lv_event_t* e) {
+      if (lv_event_get_code(e) == LV_EVENT_CLICKED) openShareMyContactPopup();   // same popup as the Chats header
+    });
+  }
+}
+#else
 static void buildProfileSettings() {
   // The name you go by on the mesh.
   {
@@ -16017,6 +16293,7 @@ static void buildProfileSettings() {
     });
   }
 }
+#endif
 
 // Single-character spam filter. A lot of mesh spam is a 1-byte payload — the cheapest
 // message there is — and it still costs every receiver a notification and a chime.
@@ -17157,7 +17434,7 @@ static void sysInfoTextRest(char* buf, size_t cap) {
     p += snprintf(buf + p, cap - p, "\n");
   }
   p += snprintf(buf + p, cap - p,
-                "Build\n  %s\n  %s\n  on meshcomod %s (MeshCore)\n  WADAMESH TOUCH\n",
+                "Build\n  %s\n  %s\n  on %s firmware\n  WADAMESH TOUCH\n",
                 FIRMWARE_VERSION, FIRMWARE_BUILD_DATE, FIRMWARE_CORE_VERSION);
 #if defined(WADAMESH_FORK_BUILD)
   // Defined in platformio.ini for this fork's builds; absent upstream.
@@ -17335,7 +17612,7 @@ static void useSdStorageToggleCb(lv_event_t* e) {
                                          : TR("Data -> internal on reboot"), 1800);
 }
 
-#if CAP_SD || defined(TLORA_PAGER)
+#if (CAP_SD || defined(TLORA_PAGER)) && !defined(WADA_MESHTASTIC)
 // "Copy internal data to SD": recovery for the beta_36 upgrades where the live
 // profile was orphaned on internal flash while the honored SD toggle adopted an
 // empty card. Pager resumes only onto a card with no identity or the identical
@@ -19197,7 +19474,7 @@ static void histSyncPickCb(lv_event_t* e) {
 static void buildGeneralPage() {
   {
     lv_obj_t* c = setCard("Mesh");
-    setActionRow(c, UI_ICON_RADIO, "Send advert now", nullptr, advertNowCb, nullptr, SET_NORMAL, false);
+    setActionRow(c, UI_ICON_RADIO, "Broadcast node info", nullptr, advertNowCb, nullptr, SET_NORMAL, false);
   }
   {
     lv_obj_t* c = setCard("Chat history");
@@ -19215,7 +19492,9 @@ static void buildGeneralPage() {
     setChoiceRow(c, "Save in the foreground after", "After this many failed background saves the chat is saved straight away, which can stutter the screen for a moment. Off keeps retrying in the background.",
                  tries, 6, sel, histSyncPickCb);
   }
-#if CAP_SD || defined(TLORA_PAGER)
+#if defined(WADA_MESHTASTIC)
+  {auto* c=setCard("Storage");setNote(c,"Meshtastic stores identity and configuration internally. Chat history uses the SD card when present at boot, otherwise the dedicated UI partition.");}
+#elif CAP_SD || defined(TLORA_PAGER)
   {
     // Everything (identity, settings, contacts, channels) on the card under /meshcomod
     // instead of internal flash. Read at boot, so it applies after a restart.
@@ -19786,7 +20065,7 @@ static void buildDeviceSettings(int sec) {
   }
 }
 
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
 static void trimWifiField(char* s) {
   if (!s) return;
   size_t n = strlen(s);
@@ -20038,7 +20317,7 @@ static lv_obj_t* s_ble_pin_ta = nullptr;   // editable 6-digit pairing-code fiel
 static void bleKbdApplyMode();   // keyboard mode follows the Bluetooth switch (key routing section)
 static void bleKbdSyncPage();    // Bluetooth page keyboard section (below)
 #endif
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
 // Bluetooth enable switch: resident BLE toggles live; enableBle() handles the
 // Pager's ordered-restart fallback for a cold stack. No Save button is needed.
 static void bleEnableSwitchCb(lv_event_t* e) {
@@ -20090,7 +20369,7 @@ static void blePinSaveCb(lv_event_t* e) {
 
 // Radio state line at the top of the Bluetooth page.
 static const char* bleModeLineText(bool ble_active) {
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
   const bool wifi_on = wifiConfigGetRadioEnabled();
   const bool ble_cap = g_lv.task && g_lv.task->hasBleCapability();
   if (ble_active) return wifi_on ? TR("Mode: BLE on (+ Wi-Fi)") : TR("Mode: BLE on");
@@ -20735,7 +21014,7 @@ static void buildBluetoothSettings() {
 #else
   {
     lv_obj_t* c = setCard("");
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
     // Must be the SAME predicate bleEnableSwitchCb compares against, or its
     // `want == requested` early-out swallows the first tap.
     g_set_modal.wifi_sw = setSwitchRow(c, "Enable Bluetooth", nullptr, ble_active || bleRequestedOrEnabled(),
@@ -20755,7 +21034,7 @@ static void buildBluetoothSettings() {
 // ----- Dedicated Wi-Fi settings page -----
 // Shows live connection state (status, IP, RSSI), web-socket count, and the
 // SSID / password fields with a single Save+reconnect button.
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
 // State captured at saveWifiCb time, applied inside the confirm callback.
 static char    s_pending_wifi_ssid[WIFI_CONFIG_SSID_MAX];
 static char    s_pending_wifi_pwd[WIFI_CONFIG_PWD_MAX];
@@ -21044,7 +21323,7 @@ static void wifiQueueScanWhenReady() {
     }
     return;
   }
-#elif defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION) && !defined(HAS_TANMATSU)
+#elif defined(ESP32) && defined(WADA_NETWORK_UI) && !defined(HAS_TANMATSU)
   wifiScanSetActive(true);
   s_wifiscan_guard_ms = millis();
   s_wifiscan_reconnect_after =
@@ -21150,7 +21429,7 @@ static void wifiRadioSwitch(bool on) {
 // the worker lists networks.
 static void wifiScanStartCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-#if defined(MULTI_TRANSPORT_COMPANION)
+#if defined(WADA_NETWORK_UI)
   if (!wifiConfigWantsWifi()) {
     if (!wifiPrepareEnable()) return;
     wifiConfigSetRadioEnabled(true);   // wantsWifi() now true -> the scan worker can bring STA up
@@ -21161,7 +21440,7 @@ static void wifiScanStartCb(lv_event_t* e) {
 #endif
 }
 
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
 static void wifiRebuildNetworkList();   // fwd: reworked Wi-Fi page list (defined before buildWifiSettings)
 #endif
 // Kick a Wi-Fi scan from the UI (LVGL ctx — only sets flags, never calls WiFi).
@@ -21170,7 +21449,7 @@ static void wifiRebuildNetworkList();   // fwd: reworked Wi-Fi page list (define
 // is resident crosses its known-unsafe coexistence boundary; its scan is
 // best-effort while associated and never turns a page-open into a reboot.
 static void wifiKickScan() {
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
   if (wifiScanIsActive() ||
       __atomic_load_n(&s_wifiscan_request, __ATOMIC_ACQUIRE) ||
       s_wifiscan_drop_req || s_wifiscan_drop_ms != 0) return;
@@ -21186,7 +21465,7 @@ static void wifiKickScan() {
 #endif
 }
 
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION) && !defined(HAS_TANMATSU)
+#if defined(ESP32) && defined(WADA_NETWORK_UI) && !defined(HAS_TANMATSU)
 // MAIN-task half of the scan-while-connected handshake. ALL WiFi state changes live
 // here (sequential with main.cpp's wifi loop on the same task — no worker race, and
 // never eraseap, which wedges this radio). Drop the link, let the disassoc settle,
@@ -21247,10 +21526,10 @@ static void wifiScanMainService() {
 
 // Loop service: when the worker finishes a scan, repopulate the popup list.
 static void wifiScanService() {
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION) && !defined(HAS_TANMATSU)
+#if defined(ESP32) && defined(WADA_NETWORK_UI) && !defined(HAS_TANMATSU)
   wifiScanMainService();   // drive the drop-link-then-scan handshake (main task)
 #endif
-#if defined(TLORA_PAGER) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(TLORA_PAGER) && defined(WADA_NETWORK_UI)
   if (s_wifiscan_wait_for_radio) {
     const bool sta_ready = (WiFi.getMode() & WIFI_MODE_STA) != 0;
     if (!wifiConfigWantsWifi()) {
@@ -21283,7 +21562,7 @@ static void wifiScanService() {
   if (!s_wifiscan_done) return;
   s_wifiscan_done = false;
   wifiScanFillList();   // legacy scan popup — no-op if closed
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
   wifiRebuildNetworkList();   // refresh the reworked Wi-Fi page (guarded: no-op unless it's open)
 #if !defined(HAS_TANMATSU)
 #if defined(TLORA_PAGER)
@@ -21314,7 +21593,7 @@ static void wifiScanService() {
 // handoff above. No separate Save action is needed.
 static void wifiRadioToggleCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
   const bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
   if (on && !wifiPrepareEnable(lv_event_get_target(e))) return;
   wifiRadioSwitch(on);
@@ -21329,7 +21608,7 @@ static void wifiRadioToggleCb(lv_event_t* e) {
 // (rebuilt on open, on scan-complete, and after connect/forget); the active
 // credentials + the 8-slot known-networks store (TouchPrefsStore) back it.
 // ============================================================================
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
 static lv_obj_t* s_wifi_list_cont      = nullptr;   // network list (valid only while the Wi-Fi modal is open)
 // s_wifi_sheet itself is declared up near s_settings_sheet (navMaybeRebuild needs it early).
 static lv_obj_t* s_wifi_sheet_ssid_ta  = nullptr;
@@ -21820,7 +22099,7 @@ static void buildWifiSettings() {
     return;
   }
 #endif
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
   {
     lv_obj_t* c = setCard("");
     g_set_modal.wifi_sw = setSwitchRow(c, "Wi-Fi", nullptr, wifiConfigGetRadioEnabled(), wifiRadioToggleCb);   // live on/off
@@ -22110,6 +22389,15 @@ static void closeActionSheet() {
 
 static void actionSheetSendMsgCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
+#if defined(WADA_MESHTASTIC)
+  ContactInfo contact{};
+  if (!the_mesh.getContactByIdx(s_action_sheet_mesh_idx, contact)) return;
+  const uint32_t number = WadaMeshtasticBackend::keyNode(contact.id.pub_key);
+  if (wadaBackend && !wadaBackend->canMessage(number)) {
+    g_lv.task->showAlert(wadaBackend->directMessageReason(number), 3000);
+    return;
+  }
+#endif
   uint32_t idx = s_action_sheet_mesh_idx;
   // Swallow the trailing touch so the upcoming tab switch + overlay show
   // doesn't have the cap-touch driver's stale "swipe in progress" state
@@ -22170,6 +22458,11 @@ static void actionSheetDeleteCb(lv_event_t* e) {
   bool ok = the_mesh.getContactByIdx(s_action_sheet_mesh_idx, c);
   closeActionSheet();
   if (!ok) { g_lv.task->showAlert(TR("Contact gone"), 1200); return; }
+#if defined(WADA_MESHTASTIC)
+  const bool queued = the_mesh.uiRemoveContact(c);
+  g_lv.task->showAlert(queued ? TR("Node removal requested") : TR("Could not queue node removal"), 2000);
+  return;
+#endif
   if (the_mesh.uiRemoveContact(c)) {   // persists the removal (/contacts3) so it doesn't reappear on reboot
     g_lv.task->showAlert(TR("Contact deleted"), 1000);
     refreshContactsList();
@@ -22197,6 +22490,15 @@ static void actionSheetResetPathCb(lv_event_t* e) {
 // Hand this contact to whoever is in direct range: re-broadcast its advert as a
 // zero-hop packet. No refreshContactsList() — unlike Reset path / Delete this
 // does not touch the contact table, it only puts a packet on the air.
+#if defined(WADA_MESHTASTIC)
+static void actionSheetShareContactCb(lv_event_t* e) {
+  if(lv_event_get_code(e)!=LV_EVENT_CLICKED||!g_lv.task)return;
+  ContactInfo contact;const bool exists=the_mesh.getContactByIdx(s_action_sheet_mesh_idx,contact);closeActionSheet();
+  char url[768];
+  if(exists&&wadaBackend->contactUrl(WadaMeshtasticBackend::keyNode(contact.id.pub_key),url,sizeof(url)))openUrlQrPopup(url);
+  else g_lv.task->showAlert("Contact information unavailable",1500);
+}
+#else
 static void actionSheetShareContactCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
   ContactInfo c;
@@ -22209,6 +22511,74 @@ static void actionSheetShareContactCb(lv_event_t* e) {
     g_lv.task->showAlert(TR("Share failed"), 1200);
   }
 }
+#endif
+
+#if defined(WADA_MESHTASTIC)
+static uint32_t s_native_telem_node = 0;
+static uint8_t s_native_telem_kind = UINT8_MAX;
+static lv_obj_t* s_native_telem_log = nullptr;
+static void wadaTelemetryPicker(uint32_t node);
+
+static void wadaTelemetryRefresh() {
+  if (!wadaBackend || !g_set_modal.root || g_set_modal.kind != SettingsModalKind::NativeTelemetry ||
+      !s_native_telem_log || s_native_telem_kind > uint8_t(wada::TelemetryKind::Host)) return;
+  static char text[6144];
+  const size_t written = wadaBackend->telemetryLog(s_native_telem_node, wada::TelemetryKind(s_native_telem_kind), text, sizeof(text), false);
+  lv_label_set_text(s_native_telem_log, written ? text : TR("No readings yet. Request this telemetry from the node."));
+}
+
+static void wadaTelemetryRequestCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !wadaBackend ||
+      !g_set_modal.root || g_set_modal.kind != SettingsModalKind::NativeTelemetry ||
+      s_native_telem_kind > uint8_t(wada::TelemetryKind::Host)) return;
+  wadaBackend->requestTelemetry(s_native_telem_node, wada::TelemetryKind(s_native_telem_kind));
+}
+
+static void wadaTelemetryNodeNote(lv_obj_t* body) {
+  const auto* node = wadaBackend ? wadaBackend->nodeInfo(s_native_telem_node) : nullptr;
+  char text[90];
+  snprintf(text, sizeof(text), "%s\n!%08x", node && node->has_user ? node->user.long_name : TR("Node"), s_native_telem_node);
+  setNote(body, text);
+}
+
+static void wadaTelemetryOpenLog(uint8_t kind) {
+  if (!wadaBackend || kind > uint8_t(wada::TelemetryKind::Host) ||
+      !wadaBackend->telemetryAvailable(s_native_telem_node, wada::TelemetryKind(kind))) return;
+  s_native_telem_kind = kind;
+  auto* body = createSettingsModal(TR(wada::telemetryName(wada::TelemetryKind(kind))), SettingsModalKind::NativeTelemetry);
+  lv_obj_set_flex_flow(body, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(body, 8, LV_PART_MAIN);
+  wadaTelemetryNodeNote(body);
+  setButton(body, UI_ICON_REFRESH_CW, "Request", wadaTelemetryRequestCb, nullptr, SET_PRIMARY);
+  setButton(body, LV_SYMBOL_LEFT, "Telemetry types", [](lv_event_t*) { wadaTelemetryPicker(s_native_telem_node); });
+  char help[112];
+  snprintf(help, sizeof(help), TR("Recent readings (up to %u across nodes and types). SI units."), unsigned(wada::TelemetryLog::Capacity));
+  setNote(body, help);
+  s_native_telem_log = setNote(body, "");
+  lv_obj_set_style_text_font(s_native_telem_log, &g_font_14, LV_PART_MAIN);
+  wadaTelemetryRefresh();
+}
+
+static void wadaTelemetryPickCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  wadaTelemetryOpenLog(uint8_t(uintptr_t(lv_event_get_user_data(e)) - 1));
+}
+
+static void wadaTelemetryPicker(uint32_t node) {
+  if (!wadaBackend || !node) return;
+  s_native_telem_node = node;
+  s_native_telem_kind = UINT8_MAX;
+  s_native_telem_log = nullptr;
+  auto* body = createSettingsModal(TR("Telemetry"), SettingsModalKind::NativeTelemetry);
+  lv_obj_set_flex_flow(body, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(body, 8, LV_PART_MAIN);
+  wadaTelemetryNodeNote(body);
+  for (uint8_t kind = 0; kind <= uint8_t(wada::TelemetryKind::Host); ++kind) {
+    if (!wadaBackend->telemetryAvailable(node, wada::TelemetryKind(kind))) continue;
+    setButton(body, nullptr, wada::telemetryName(wada::TelemetryKind(kind)), wadaTelemetryPickCb, (void*)(uintptr_t(kind) + 1));
+  }
+}
+#endif
 
 // "Telemetry" — fire REQ_TYPE_GET_TELEMETRY_DATA at the selected contact.
 // The reply lands on UITask::onPingReply (same as STATUS) with the raw LPP
@@ -22221,7 +22591,9 @@ static void actionSheetTelemetryCb(lv_event_t* e) {
   bool ok = the_mesh.getContactByIdx(s_action_sheet_mesh_idx, c);
   closeActionSheet();
   if (!ok) { g_lv.task->showAlert(TR("Contact gone"), 1200); return; }
-#if CAP_SD || defined(TLORA_PAGER)
+#if defined(WADA_MESHTASTIC)
+  wadaTelemetryPicker(WadaMeshtasticBackend::keyNode(c.id.pub_key));
+#elif CAP_SD || defined(TLORA_PAGER)
   // Open the telemetry window on its history; it does NOT auto-request. The user
   // taps the Request button (refresh glyph, left of the gear) to poll.
   memcpy(s_telem_node, c.id.pub_key, 6);
@@ -23067,6 +23439,14 @@ static void actionSheetFavoriteCb(lv_event_t* e) {
   closeActionSheet();
   if (!ok) { g_lv.task->showAlert(TR("Contact gone"), 1200); return; }
 #if defined(ESP32)
+#if defined(WADA_MESHTASTIC)
+  const bool wanted = !wadaContactIsFavorite(c);
+  const bool queued = the_mesh.uiSetContactFavorite(c.id.pub_key, wanted);
+  if (queued) touchPrefsSetFavorite(c.id.pub_key, wanted);
+  g_lv.task->showAlert(queued ? TR("Favorite update requested") : TR("Could not queue favorite update"), 1800);
+  contactsListForceRefresh();
+  return;
+#endif
   bool was_fav = touchPrefsIsFavorite(c.id.pub_key);
   bool now_fav = touchPrefsSetFavorite(c.id.pub_key, !was_fav);
   if (!was_fav && !now_fav) {
@@ -23077,7 +23457,11 @@ static void actionSheetFavoriteCb(lv_event_t* e) {
     g_lv.task->showAlert(full_msg, 1500);
     return;
   }
-  the_mesh.uiSetContactFavorite(c.id.pub_key, now_fav);   // eviction protection (#178)
+  if (!the_mesh.uiSetContactFavorite(c.id.pub_key, now_fav)) {
+    touchPrefsSetFavorite(c.id.pub_key, was_fav);
+    g_lv.task->showAlert(TR("Favorite update could not be saved"), 1800);
+    return;
+  }
   g_lv.task->showAlert(now_fav ? TR("Added to favorites") : TR("Removed from favorites"), 1100);
   // Force a list rebuild so the star (or its removal) shows immediately — a plain
   // refresh hits the no-change cache (the contact count is unchanged by a fav toggle).
@@ -23205,7 +23589,7 @@ static void actionSheetCloseCb(lv_event_t* e) {
 // (4/3-earth-radius radio model) to the terrain, then compare against a
 // straight antenna-to-antenna sight line. Fresnel-zone clearance (0.6·F1)
 // separates "clear" from "marginal".
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
 static constexpr int     k_los_samples  = 24;   // path sample points (was 40:
                                                  // shorter request = faster,
                                                  // cross-section still smooth)
@@ -23772,10 +24156,129 @@ static void actionSheetNicknameCb(lv_event_t* e) {
   closeActionSheet();
   openNicknameEditor(c);
 }
+#if defined(WADA_MESHTASTIC)
+static uint32_t wadaMenuNode = 0;
+static bool wadaSelectThreadNode(int index) {
+  uint8_t key[32];
+  if (!g_lv.task || !g_lv.task->getThreadContactPub(index, key)) return false;
+  wadaMenuNode = WadaMeshtasticBackend::keyNode(key);
+  return wadaMenuNode != 0;
+}
+static void wadaNodeAction(void (*callback)(lv_event_t *)) {
+  bool found = false;
+  for (int i = 0; i < the_mesh.getNumContacts(); ++i) {
+    ContactInfo contact{};
+    if (the_mesh.getContactByIdx(i, contact) && WadaMeshtasticBackend::keyNode(contact.id.pub_key) == wadaMenuNode) {
+      s_action_sheet_mesh_idx = i;
+      found = true;
+      break;
+    }
+  }
+  if (!found) return;
+  lv_event_t event{};
+  event.code = LV_EVENT_CLICKED;
+  event.target = event.current_target = lv_scr_act();
+  callback(&event);
+}
+static uint32_t wadaSelectedNode() {
+  return wadaMenuNode;
+}
+static void wadaExchangeUserInfo() {
+  const bool queued = wadaBackend && wadaBackend->requestUserInfo(wadaSelectedNode());
+  if (g_lv.task) g_lv.task->showAlert(queued ? TR("Node information requested") : TR("Could not request node information"), 2000);
+}
+static void wadaRemoveSelectedNode() {
+  ContactInfo contact{};
+  if (!the_mesh.getContactByIdx(s_action_sheet_mesh_idx, contact)) return;
+  char text[180];
+  snprintf(text, sizeof(text), TR("Remove %s from the node database? It may reappear when heard again."), contact.name);
+  showConfirm(text, TR("Remove"), [] { wadaNodeAction(actionSheetDeleteCb); });
+}
+static void wadaNodeDetails() {
+  const uint32_t number = wadaSelectedNode();
+  const auto *node = wadaBackend ? wadaBackend->nodeInfo(number) : nullptr;
+  if (!node) return;
+  auto *body = createSettingsModal(TR("Node details"), SettingsModalKind::NativeNodeDetails);
+  lv_obj_set_flex_flow(body, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(body, 8, LV_PART_MAIN);
+  char text[220];
+  snprintf(text, sizeof(text), "%s\n%s\n!%08x", node->user.long_name, node->user.short_name, number);
+  auto* identity = setBox(body);
+  lv_obj_set_size(identity, lv_pct(100), LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(identity, LV_FLEX_FLOW_ROW);
+  lv_obj_set_style_pad_column(identity, 8, LV_PART_MAIN);
+  const auto security = wadaBackend->nodeSecurity(number);
+  wadaSecurityGlyph(identity, security);
+  auto* name = lv_label_create(identity);
+  lv_obj_set_flex_grow(name, 1);
+  lv_label_set_long_mode(name, LV_LABEL_LONG_WRAP);
+  lv_label_set_text(name, text);
+  lv_obj_set_style_text_font(name, &g_font_14, LV_PART_MAIN);
+  lv_obj_set_style_text_color(name, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+  if (number == wadaBackend->nodeNumber()) {
+    lv_obj_add_flag(identity, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(identity, [](lv_event_t*) { wadaOwnIdentityMenu(); }, LV_EVENT_LONG_PRESSED, nullptr);
+    setButton(body, UI_ICON_PENCIL, "Edit identity", [](lv_event_t*) { wadaOwnIdentityMenu(); });
+  }
+  wadaStatusRow(body, wadaBackend->nodeStatus(number), s_settings_content_w, true);
+  setNote(body, wadaSecurityHelp(security));
+  if (wadaBackend->unheardOnCurrentLora(number))
+    setNote(body, TR("Not heard on your current LoRa settings"), SET_TONE_WARN);
+  bool hasPublicKey = false;
+  if (node->user.public_key.size == 32)
+    for (auto byte : node->user.public_key.bytes) hasPublicKey |= byte != 0;
+  if (hasPublicKey) {
+    char key[65];
+    for (unsigned i = 0; i < 32; ++i) snprintf(key + 2 * i, 3, "%02x", node->user.public_key.bytes[i]);
+    setNote(body, key);
+  }
+  if (node->has_hops_away) {
+    snprintf(text, sizeof(text), TR("Hops away: %u%s"), unsigned(node->hops_away), node->via_mqtt ? TR(" (via MQTT)") : "");
+    setNote(body, text);
+  } else setNote(body, TR("Hops away: unknown"));
+  const char* version = wadaBackend->nodeFirmwareVersion(number);
+  if (version && version[0]) setInfoRow(body, "Firmware", version);
+  setButton(body, UI_ICON_INFO, "Request node metadata", [](lv_event_t*) {
+    const bool queued = wadaBackend && wadaBackend->requestNodeMetadata(wadaSelectedNode());
+    if (g_lv.task) g_lv.task->showAlert(queued ? TR("Node metadata requested") : TR("Could not request node metadata"), 2500);
+  });
+  if (!wadaBackend->canMessage(number)) setNote(body, wadaBackend->directMessageReason(number));
+  setButton(body, UI_ICON_REFRESH_CW, "Exchange user info", [](lv_event_t *) { wadaExchangeUserInfo(); });
+  setButton(body, LV_SYMBOL_BATTERY_3, "Telemetry", [](lv_event_t *) { wadaTelemetryPicker(wadaSelectedNode()); });
+  s_native_details_node = number;
+  s_native_details_stamp = wadaNodeDetailsStamp(number);
+}
+#endif
 static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const char* name, bool from_map = false) {
   s_action_sheet_mesh_idx = mesh_idx;
   s_action_sheet_is_repeater = is_repeater;
   closeActionSheet();
+#if defined(WADA_MESHTASTIC)
+  ContactInfo contact{};
+  if (!the_mesh.getContactByIdx(mesh_idx, contact)) return;
+  const uint32_t number = WadaMeshtasticBackend::keyNode(contact.id.pub_key);
+  if (!number) return;
+  wadaMenuNode = number;
+  ActItem actions[11];
+  int count = 0;
+  if (wadaBackend && wadaBackend->canMessage(number))
+    actions[count++] = { LV_SYMBOL_ENVELOPE, TR("Message"), [] { wadaNodeAction(actionSheetSendMsgCb); }, false };
+  const bool favorite = wadaContactIsFavorite(contact);
+  actions[count++] = { TOUCH_SYM_STAR, favorite ? TR("Remove from favorites") : TR("Add to favorites"),
+                      [] { wadaNodeAction(actionSheetFavoriteCb); }, false };
+  actions[count++] = { UI_ICON_INFO, TR("Node details"), wadaNodeDetails, false };
+  actions[count++] = { UI_ICON_REFRESH_CW, TR("Exchange user info"), wadaExchangeUserInfo, false };
+  actions[count++] = { UI_ICON_ROUTE, TR("Trace route"), [] { wadaNodeAction(actionSheetTracePingCb); }, false };
+  actions[count++] = { LV_SYMBOL_BATTERY_3, TR("Telemetry"), [] { wadaNodeAction(actionSheetTelemetryCb); }, false };
+  if (!from_map && (contact.gps_lat || contact.gps_lon))
+    actions[count++] = { LV_SYMBOL_GPS, TR("Show on map"), [] { wadaNodeAction(actionSheetShowOnMapCb); }, false };
+  actions[count++] = { UI_ICON_QR_CODE, TR("Share contact QR"), [] { wadaNodeAction(actionSheetShareContactCb); }, false };
+  const bool ignored = touchPrefsIsIgnored(contact.id.pub_key);
+  actions[count++] = { LV_SYMBOL_CLOSE, ignored ? TR("Stop ignoring on this display") : TR("Ignore on this display"), [] { wadaNodeAction(actionSheetBlockCb); }, false };
+  actions[count++] = { LV_SYMBOL_TRASH, TR("Remove"), wadaRemoveSelectedNode, true };
+  openActionList(name ? name : TR("Node"), actions, count);
+  return;
+#endif
 
   lv_coord_t sw = lv_disp_get_hor_res(nullptr);
   lv_coord_t sh = lv_disp_get_ver_res(nullptr);
@@ -23838,7 +24341,7 @@ static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const ch
     }
   }
   const int sub_h = nick ? (int)lv_font_get_line_height(&g_font_12) + 2 : 0;
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
   {
     ContactInfo _lc;
     const bool peer_gps = the_mesh.getContactByIdx(mesh_idx, _lc) &&
@@ -24022,7 +24525,7 @@ static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const ch
     mk_btn(TR(LV_SYMBOL_SETTINGS "  Admin"), actionSheetAdminCb, 0);
   }
   mk_btn(TR(LV_SYMBOL_WIFI "  Range test"), actionSheetRangeTestCb, 0);
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
   // Terrain-aware line-of-sight (needs both GPS fixes; gated by has_los).
   if (has_los) mk_btn(TR(LV_SYMBOL_GPS "  Sightline"), actionSheetLosCb, 0);
 #endif
@@ -24226,6 +24729,16 @@ static void createPrivateChannelSubmitCb(lv_event_t* e) {
 // 64-hex pubkey into raw bytes and ask MyMesh::uiAddManualContact to wedge
 // a synthetic chat-type contact into the table. State pointers are
 // declared earlier in the file so closeSettingsModal can null them.
+#if defined(WADA_MESHTASTIC)
+static bool hexToPubkey32(const char* hex, uint8_t out[32]) {
+  if(!hex)return false;
+  if(*hex=='!')++hex;
+  if(strlen(hex)!=8)return false;
+  for(unsigned i=0;i<8;++i)if(!isxdigit(static_cast<unsigned char>(hex[i])))return false;
+  const uint32_t node=strtoul(hex,nullptr,16);if(!node||node==0xffffffff)return false;
+  WadaMeshtasticBackend::nodeKey(node,out);return true;
+}
+#else
 static bool hexToPubkey32(const char* hex, uint8_t out[32]) {
   if (!hex) return false;
   int n = 0;
@@ -24245,10 +24758,28 @@ static bool hexToPubkey32(const char* hex, uint8_t out[32]) {
   }
   return true;
 }
+#endif
 
 static void addContactSubmitCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   kbMirrorSyncToReal();
+#if defined(WADA_MESHTASTIC)
+  if (!s_addct_pub_ta || !wadaBackend) return;
+  uint8_t key[32]{};
+  const bool valid = hexToPubkey32(lv_textarea_get_text(s_addct_pub_ta), key);
+  const uint32_t number = valid ? WadaMeshtasticBackend::keyNode(key) : 0;
+  if (!number || number == wadaBackend->nodeNumber()) {
+    if (s_addct_error_l) lv_label_set_text(s_addct_error_l, TR("Enter another node's ID: !1234abcd"));
+    return;
+  }
+  if (!wadaBackend->requestUserInfo(number)) {
+    if (s_addct_error_l) lv_label_set_text(s_addct_error_l, TR("Could not queue node-info request"));
+    return;
+  }
+  closeSettingsModal();
+  if (g_lv.task) g_lv.task->showAlert(TR("Node info requested; the node appears when heard"), 2400);
+  return;
+#endif
   if (!s_addct_pub_ta || !s_addct_name_ta) return;
   const char* pub_raw  = lv_textarea_get_text(s_addct_pub_ta);
   const char* name_raw = lv_textarea_get_text(s_addct_name_ta);
@@ -24262,7 +24793,7 @@ static void addContactSubmitCb(lv_event_t* e) {
 
   uint8_t pub[32];
   if (!hexToPubkey32(hex, pub)) {
-    if (s_addct_error_l) lv_label_set_text(s_addct_error_l, TR("Pubkey must be 64 hex chars."));
+    if (s_addct_error_l) lv_label_set_text(s_addct_error_l, TR("Use a Meshtastic node ID: !1234abcd"));
     return;
   }
   char name[32] = {0};
@@ -24284,7 +24815,7 @@ static void addContactSubmitCb(lv_event_t* e) {
 
 static void openAddContactModalCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  lv_obj_t* body = createSettingsModal(TR("Add contact"), SettingsModalKind::AddContact);
+  lv_obj_t* body = createSettingsModal(TR("Find node by ID"), SettingsModalKind::AddContact);
   int y = 0;
 
   lv_obj_t* hint = lv_label_create(body);
@@ -24292,12 +24823,12 @@ static void openAddContactModalCb(lv_event_t* e) {
   lv_obj_set_width(hint, lv_pct(100));
   lv_obj_set_style_text_color(hint, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
   lv_obj_set_style_text_font(hint, &g_font_12, LV_PART_MAIN);
-  lv_label_set_text(hint, TR("Paste the 64-hex public key and a name. Useful when you want to DM someone before their advert has arrived."));
+  lv_label_set_text(hint, TR("Request a node's identity and public key by ID. It appears in Nodes after a response."));
   lv_obj_set_pos(hint, 2, y);
   y += 48;
 
   lv_obj_t* pub_l = lv_label_create(body);
-  lv_label_set_text(pub_l, TR("Public key (64 hex chars)"));
+  lv_label_set_text(pub_l, TR("Node ID (!1234abcd)"));
   lv_obj_set_style_text_color(pub_l, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
   lv_obj_set_style_text_font(pub_l, &g_font_12, LV_PART_MAIN);
   lv_obj_set_pos(pub_l, 2, y);
@@ -24306,11 +24837,12 @@ static void openAddContactModalCb(lv_event_t* e) {
   lv_obj_set_size(s_addct_pub_ta, lv_pct(100),56);
   lv_obj_set_pos(s_addct_pub_ta, 2, y);
   lv_textarea_set_one_line(s_addct_pub_ta, false);
-  taSetPlaceholder(s_addct_pub_ta, TR("0123456789abcdef…"));
-  lv_textarea_set_max_length(s_addct_pub_ta, 80);
+  taSetPlaceholder(s_addct_pub_ta, TR("!1234abcd"));
+  lv_textarea_set_max_length(s_addct_pub_ta, 9);
   attachSettingsTaEvents(s_addct_pub_ta);
   y += 60;
 
+#if !defined(WADA_MESHTASTIC)
   lv_obj_t* name_l = lv_label_create(body);
   lv_label_set_text(name_l, TR("Name"));
   lv_obj_set_style_text_color(name_l, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
@@ -24325,6 +24857,7 @@ static void openAddContactModalCb(lv_event_t* e) {
   lv_textarea_set_max_length(s_addct_name_ta, 31);
   attachSettingsTaEvents(s_addct_name_ta);
   y += 36;
+#endif
 
   s_addct_error_l = lv_label_create(body);
   lv_label_set_long_mode(s_addct_error_l, LV_LABEL_LONG_WRAP);
@@ -24350,7 +24883,7 @@ static void openAddContactModalCb(lv_event_t* e) {
   lv_obj_add_event_cb(b, addContactSubmitCb, LV_EVENT_CLICKED, nullptr);
   lv_obj_t* bl = lv_label_create(b);
   useChainedFont(bl);
-  lv_label_set_text(bl, TR("Add contact"));
+  lv_label_set_text(bl, TR("Exchange user info"));
   lv_obj_center(bl);
 }
 
@@ -24617,6 +25150,11 @@ static void joinHashtagChannelSubmitCb(lv_event_t* e) {
 // Chat links prefill the join form and open the channel after confirmation;
 // the Chats "+" action starts with "#" and returns to the list after joining.
 static void openJoinHashtagChannelModal(const char* prefilled_tag = nullptr) {
+#if defined(WADA_MESHTASTIC)
+  (void)prefilled_tag;
+  openSettingsCategory(CAT_CHANNELS);
+  return;
+#endif
   lv_obj_t* body = createSettingsModal(TR("Join hashtag channel"), SettingsModalKind::ChJoinTag);
   s_addch_open_after_join = prefilled_tag && prefilled_tag[0];
   int y = 0;
@@ -24706,6 +25244,7 @@ static void addChannelJoinHashtagCb(lv_event_t* e) {
 }
 
 static void openAddChannelSheet() {
+  openSettingsCategory(CAT_CHANNELS);return;
   closeAddChannelSheet();
   s_addch_sheet = lv_obj_create(lv_layer_top());
   lv_obj_remove_style_all(s_addch_sheet);
@@ -24815,6 +25354,158 @@ static void shareMyContactBackdropCb(lv_event_t* e) {
   closeShareMyContact();
 }
 
+#if defined(WADA_MESHTASTIC)
+static void openShareMyContactPopup() {
+  closeShareMyContact();
+
+  // Collect self identity. Fallbacks keep the popup useful even when the
+  // node name hasn't been set yet (the QR will just say "node").
+#if defined(WADA_MESHTASTIC)
+  if (!wadaBackend || wadaBackend->ownUser().public_key.size != 32) {
+    if (g_lv.task) g_lv.task->showAlert(TR("No native public key available"), 2000);
+    return;
+  }
+  const uint8_t* pub = wadaBackend->ownUser().public_key.bytes;
+#else
+  const uint8_t* pub = the_mesh.getSelfPubKey();
+#endif
+  const char* node_name = (g_lv.task ? g_lv.task->getNodeNameCstr() : "");
+  const char* name = (node_name && node_name[0]) ? node_name : "node";
+
+  char pub_hex[65] = {0};
+  for (int i = 0; i < 32; ++i) {
+    static const char* k_hex = "0123456789abcdef";
+    pub_hex[i*2 + 0] = k_hex[(pub[i] >> 4) & 0xF];
+    pub_hex[i*2 + 1] = k_hex[ pub[i]       & 0xF];
+  }
+  // URL-encode the name: only the chars likely to appear (spaces, punct)
+  // really need it; this is a pragmatic subset. Touch firmware will read
+  // the raw bytes back anyway. 96-byte buffer = up to ~32 char name with
+  // %xx escapes.
+  char name_enc[96] = {0};
+  {
+    int o = 0;
+    for (int i = 0; name[i] && o + 4 < (int)sizeof(name_enc); ++i) {
+      const unsigned char c = (unsigned char)name[i];
+      const bool plain = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+                         || (c >= '0' && c <= '9') || c == '-' || c == '_';
+      if (plain) {
+        name_enc[o++] = c;
+      } else {
+        static const char* k_hex = "0123456789ABCDEF";
+        name_enc[o++] = '%';
+        name_enc[o++] = k_hex[(c >> 4) & 0xF];
+        name_enc[o++] = k_hex[ c       & 0xF];
+      }
+    }
+    name_enc[o] = '\0';
+  }
+  char payload[768];
+  // Official MeshCore contact-share URI (matches what the phone app's "Add Contact
+  // → Scan QR Code" expects): meshcore://contact/add?name=<urlenc>&public_key=<64
+  // lowercase hex>&type=<1=Companion,2=Repeater,3=Room,4=Sensor>. A touch radio is
+  // always a Companion. The old `meshcore://add?p=…&n=…` form parsed in nothing.
+  if(!wadaBackend || !wadaBackend->contactUrl(wadaBackend->nodeNumber(),payload,sizeof(payload))) {
+    if(g_lv.task)g_lv.task->showAlert("Meshtastic identity is still loading",1800);return;
+  }
+
+  lv_coord_t sw = lv_disp_get_hor_res(nullptr);
+  lv_coord_t sh = lv_disp_get_ver_res(nullptr);
+  s_share_my_root = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(s_share_my_root);
+  // Sit below the global status bar — same pattern as every other popup.
+  lv_obj_set_size(s_share_my_root, sw, sh - STATUSBAR_H);
+  lv_obj_set_pos(s_share_my_root, 0, STATUSBAR_H);
+  lv_obj_set_style_bg_color(s_share_my_root, lv_color_hex(0x000000), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_share_my_root, LV_OPA_60, LV_PART_MAIN);
+  lv_obj_clear_flag(s_share_my_root, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(s_share_my_root, shareMyContactBackdropCb, LV_EVENT_CLICKED, nullptr);
+
+  // Card: title row at top, QR centered, hex pubkey under it (handy when
+  // the operator wants to dictate it over voice and there's no camera).
+  // Clamp to the usable area and scale the QR to fit so the popup never runs
+  // off the shorter landscape screen.
+  int card_w;
+  int card_h;
+#if defined(TLORA_PAGER)
+  // The Pager is very wide and very short. Use that width instead of squeezing
+  // a portrait card into the middle: QR on the left, identity prefix on the
+  // right, with a single title row across the top.
+  card_w = 360;
+  if (card_w > modalAvailW()) card_w = modalAvailW();
+  card_h = modalAvailH();
+  int qr_size = card_h - 54;   // 10-px card padding + 32-px title row + 2-px bottom breathing room
+#else
+  card_w = PCW(220);
+  if (card_w > modalAvailW()) card_w = modalAvailW();
+  card_h = PSC(270);
+  if (card_h > modalAvailH()) card_h = modalAvailH();
+  int qr_size = card_h - 34 - 30 - 20;   // title row + hex caption + padding
+#endif
+  if (qr_size > PSC(160)) qr_size = PSC(160);   // bigger QR on the Tanmatsu panel
+  if (qr_size > card_w - 20) qr_size = card_w - 20;
+  if (qr_size < 96) qr_size = 96;
+  lv_obj_t* card = lv_obj_create(s_share_my_root);
+  lv_obj_remove_style_all(card);
+  lv_obj_set_size(card, card_w, card_h);
+  lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
+  lv_obj_set_style_bg_color(card, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_radius(card, 8, LV_PART_MAIN);
+  lv_obj_set_style_border_color(card, lv_color_hex(COLOR_BORDER), LV_PART_MAIN);
+  lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(card, 10, LV_PART_MAIN);
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+  addCloseXBadge(card, shareMyContactBackdropCb);
+
+  lv_obj_t* title = lv_label_create(card);
+  lv_label_set_text_fmt(title, TR("Share: %s"), name);
+  lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
+  // Constrain both dimensions: LONG_DOT with only a width can wrap to a second
+  // line, which puts a long node name on top of the QR.
+  lv_obj_set_size(title, card_w - 20 - 32, lv_font_get_line_height(&g_font_14));
+  lv_obj_set_style_text_color(title, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+  lv_obj_set_style_text_font(title, &g_font_14, LV_PART_MAIN);
+  lv_obj_set_pos(title, 0, 4);
+
+  // QR widget — 160 px in a 220 px card with 10 px padding leaves 20 px
+  // gutters left/right. Dark = pure black, light = white-ish; LVGL needs
+  // strong contrast for the camera-side decoder.
+  lv_obj_t* qr = lv_qrcode_create(card, qr_size,
+                                  lv_color_hex(0x000000),
+                                  lv_color_hex(0xFFFFFF));
+  lv_qrcode_update(qr, payload, strlen(payload));
+#if defined(TLORA_PAGER)
+  lv_obj_align(qr, LV_ALIGN_TOP_LEFT, 0, 32);
+#else
+  lv_obj_align(qr, LV_ALIGN_TOP_MID, 0, 32);
+#endif
+  // White frame around the QR so the camera-side QR detector doesn't get
+  // confused by the dark card bleeding into the quiet zone.
+  lv_obj_set_style_border_color(qr, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+  lv_obj_set_style_border_width(qr, 4, LV_PART_MAIN);
+
+  // Short pubkey prefix below the QR — quick visual check that two
+  // devices show the same identity.
+  char prefix_buf[24];
+  snprintf(prefix_buf, sizeof(prefix_buf), "%02X%02X%02X%02X%02X%02X",
+           pub[0], pub[1], pub[2], pub[3], pub[4], pub[5]);
+  lv_obj_t* hex_lbl = lv_label_create(card);
+  lv_label_set_text(hex_lbl, prefix_buf);
+  lv_obj_set_style_text_color(hex_lbl, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_set_style_text_font(hex_lbl, &g_font_12, LV_PART_MAIN);
+#if defined(TLORA_PAGER)
+  const int hex_w = card_w - 20 - qr_size - 12;
+  lv_obj_set_width(hex_lbl, hex_w);
+  lv_obj_set_style_text_align(hex_lbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+  lv_obj_align_to(hex_lbl, qr, LV_ALIGN_OUT_RIGHT_MID, 12, 0);
+#else
+  // Anchor under the QR (not the card bottom) so it can't ride up onto the
+  // code when the QR shrinks in landscape.
+  lv_obj_align_to(hex_lbl, qr, LV_ALIGN_OUT_BOTTOM_MID, 0, 6);
+#endif
+}
+#else
 static void openShareMyContactPopup() {
   closeShareMyContact();
 
@@ -24956,6 +25647,7 @@ static void openShareMyContactPopup() {
   lv_obj_align_to(hex_lbl, qr, LV_ALIGN_OUT_BOTTOM_MID, 0, 6);
 #endif
 }
+#endif
 
 static void shareMyContactBtnCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
@@ -26095,6 +26787,7 @@ static bool          s_term_to_set        = false;
 static bool          s_term_to_is_channel = false;
 static uint8_t       s_term_to_pub[32]    = {0};
 static int16_t       s_term_to_chan_slot  = -1;
+static uint8_t s_term_channel_identity[32]{};
 static char          s_term_to_name[40]   = {0};
 
 // ===== File manager =========================================================
@@ -26176,70 +26869,25 @@ static struct { fs::FS* fs; char path[200]; char name[64]; bool isdir; bool is_c
   s_fm_clip = {};
 
 static const char* k_term_banner =
-  "WADAMESH terminal - CLI + chat on this node.\n"
-  "Type a command or tap the list icon for the picker.\n"
-  "Chat: 'to <name>' joins a contact/channel, then just\n"
-  "      type to send. 'exit' leaves. list / channels.\n"
-  "      All incoming msgs print live.\n"
-  "Config: ver clock status get advert reboot\n"
-  "        set <name|freq|bw|sf|cr|tx> <value>\n"
-  "MeshCom: wifi status, tcp status, ble status,\n"
-  "         mqtt status, ota status, tcp/ble on/off.\n";
-
-// Quick-pick catalogue (mirrors the repeater admin picker). Commands here are
-// the ones MyMesh::handleMeshcomodCommand understands natively when run
-// locally. Tapping a row stuffs the template into the input; "set ..." rows
-// carry a trailing space so the value can be typed straight after.
+  "Meshtastic terminal\n"
+  "info / nodes / channels / lora / device / position\n"
+  "nodeinfo broadcasts native node information.\n"
+  "help lists native settings commands.\n"
+  "Chat: to <name>, send <text>, public <text>, exit.\n"
+  "Incoming messages appear live.\n";
 static const AdminCmdEntry k_term_cmds[] = {
-  { "[ CHAT ]", nullptr },
-  { "list - list contacts",           "list" },
-  { "channels - list channels",       "channels" },
-  { "chan add <name> [key]",          "chan add " },
-  { "chan add #tag - hashtag chan",   "chan add #" },
-  { "chan del <ch> - delete chan",    "chan del " },
-  { "chan key <ch> - show chan key",  "chan key " },
-  { "to <name> - join contact/chan",  "to " },
-  { "send <text> - msg recipient",    "send " },
-  { "public <text> - public channel", "public " },
-  { "exit - leave current chat",      "exit" },
-  { "[ INFO ]", nullptr },
-  { "help - command list",            "help" },
-  { "ver - firmware version",         "ver" },
-  { "clock - show RTC time",          "clock" },
-  { "status - device status",         "status" },
-  { "get - show radio params",        "get" },
-  { "[ RADIO / MESH ]", nullptr },
-  { "advert - flood advert",          "advert" },
-  { "advert.zerohop - 0-hop advert",  "advert.zerohop" },
-  { "set name <new>",                 "set name " },
-  { "set freq <MHz>",                 "set freq " },
-  { "set bw <kHz>",                   "set bw " },
-  { "set sf <7-12>",                  "set sf " },
-  { "set cr <5-8>",                   "set cr " },
-  { "set tx <dBm>",                   "set tx " },
-  { "[ CONNECTIVITY ]", nullptr },
-  { "wifi status",                    "wifi status" },
-  { "wifi on",                        "wifi on" },
-  { "wifi off",                       "wifi off" },
-  { "wifi scan",                      "wifi scan" },
-  { "wifi set ssid <v>",              "wifi set ssid " },
-  { "wifi set pwd <v>",               "wifi set pwd " },
-  { "wifi apply - connect now",       "wifi apply" },
-  { "wifi clear - forget creds",      "wifi clear" },
-  { "mqtt status",                    "mqtt status" },
-  { "tcp status",                     "tcp status" },
-  { "tcp on",                         "tcp on" },
-  { "tcp off",                        "tcp off" },
-  { "ble status",                     "ble status" },
-  { "ble on",                         "ble on" },
-  { "ble off",                        "ble off" },
-  { "ota status",                     "ota status" },
-  { "ota start",                      "ota start" },
-  { "ota url <https://...bin>",       "ota url " },
-  { "ota netdiag - net check",        "ota netdiag" },
-  { "[ SYSTEM ]", nullptr },
-  { "reboot",                         "reboot" },
-  { "bootloader - download mode",     "bootloader" },
+ {"[ MESHTASTIC ]",nullptr},
+ {"help","help"},{"info - native node status","info"},{"nodes - node database","nodes"},{"channels - native slots","channels"},
+ {"lora - current configuration","lora"},{"device - node-info schedule","device"},{"position - position settings","position"},{"sync - refresh configuration","sync"},
+ {"[ LORA ]",nullptr},
+ {"lora region <US|EU_868|...>","lora region "},{"lora preset <LONG_FAST|...>","lora preset "},
+ {"lora hop <1-7>","lora hop "},{"lora power <0-30>","lora power "},{"lora tx <on|off>","lora tx "},{"lora slot <0-65535>","lora slot "},
+ {"[ NODE INFO ]",nullptr},
+ {"nodeinfo - broadcast identity","nodeinfo"},{"nodeinfo onehop","nodeinfo onehop"},{"nodeinfo request - ask nearby nodes","nodeinfo request"},
+ {"nodeinfo interval <seconds>","nodeinfo interval "},{"position interval <seconds>","position interval "},{"name <long name>","name "},
+ {"[ CHAT ]",nullptr},
+ {"to <node or channel name>","to "},{"send <text>","send "},{"public <text>","public "},{"exit - leave current chat","exit"},
+ {"[ SYSTEM ]",nullptr},{"reboot","reboot"},{"shutdown","shutdown"}
 };
 constexpr int k_term_cmds_count = sizeof(k_term_cmds) / sizeof(k_term_cmds[0]);
 
@@ -26422,7 +27070,14 @@ static void termDoSend(bool is_channel, const uint8_t* pub, int16_t chan_slot,
   const char* sender = the_mesh.getNodePrefs()->node_name;
   if (!sender || !sender[0]) sender = "me";
   char body[MAX_TEXT_LEN + 1];
-  arabicUnshape(text, body, sizeof(body));   // standard Arabic letters (#582), whole characters
+#if defined(WADA_MESHTASTIC)
+  if (!wadaNormalizeMessage(text, body, sizeof(body), true)) {
+    termLogAppendC(TERM_C_ERR, nullptr, "Message is too long or invalid UTF-8; nothing was sent");
+    return;
+  }
+#else
+  arabicUnshape(text, body, sizeof(body));
+#endif
 
   uint32_t ts = the_mesh.getRTCClock()->getCurrentTimeUnique();
   if (ts <= s_last_term_tx_ts) ts = s_last_term_tx_ts + 1;
@@ -26430,6 +27085,17 @@ static void termDoSend(bool is_channel, const uint8_t* pub, int16_t chan_slot,
 
   char r[MAX_TEXT_LEN + 48];
   if (is_channel) {
+#if defined(WADA_MESHTASTIC)
+    if (s_term_to_set && s_term_to_is_channel && disp == s_term_to_name) {
+      uint8_t current[32];
+      if (!wadaBackend || !wadaBackend->channelIdentity(chan_slot, current) || memcmp(current, s_term_channel_identity, 32)) {
+        s_term_to_set = false;
+        s_term_to_chan_slot = -1;
+        termLogAppendC(TERM_C_ERR, nullptr, "channel configuration changed; select the recipient again with 'to'");
+        return;
+      }
+    }
+#endif
     ChannelDetails cd;
     if (chan_slot < 0 || !the_mesh.getChannel(chan_slot, cd) || !cd.name[0]) {
       termLogAppendC(TERM_C_ERR, nullptr, "channel not found");
@@ -26512,6 +27178,12 @@ static void termCmdTo(const char* arg) {
     ChannelDetails cd;
     if (the_mesh.getChannel(s, cd) && cd.name[0] &&
         strncasecmp(cd.name, arg, alen) == 0) {
+#if defined(WADA_MESHTASTIC)
+      if (!wadaBackend || !wadaBackend->channelIdentity(s, s_term_channel_identity)) {
+        termLogAppendC(TERM_C_ERR, nullptr, "channel configuration is synchronizing; try again shortly");
+        return;
+      }
+#endif
       s_term_to_chan_slot = (int16_t)s;
       s_term_to_is_channel = true;
       s_term_to_set = true;
@@ -26720,6 +27392,18 @@ static void termCmdSend(const char* text) {
   termDoSend(s_term_to_is_channel, s_term_to_pub, s_term_to_chan_slot, s_term_to_name, text);
 }
 
+#if defined(WADA_MESHTASTIC)
+static void termCmdPublic(const char* text) {
+  while (*text == ' ' || *text == '\t') ++text;
+  if (!*text) { termLogAppendC(TERM_C_ERR, nullptr, "usage: primary <text> (public is an alias)"); return; }
+  ChannelDetails cd;
+  int primary = -1;
+  for (unsigned slot = 0; wadaBackend && slot < 8; ++slot)
+    if (wadaBackend->channelConfig(slot).role == meshtastic_Channel_Role_PRIMARY) { primary = slot; break; }
+  if (primary < 0 || !the_mesh.getChannel(primary, cd) || !cd.name[0]) { termLogAppendC(TERM_C_ERR, nullptr, "no configured primary channel"); return; }
+  termDoSend(true, nullptr, primary, cd.name, text);
+}
+#else
 static void termCmdPublic(const char* text) {
   while (*text == ' ' || *text == '\t') ++text;
   if (!*text) { termLogAppendC(TERM_C_ERR, nullptr, "usage: public <text>"); return; }
@@ -26727,6 +27411,7 @@ static void termCmdPublic(const char* text) {
   if (!the_mesh.getChannel(0, cd) || !cd.name[0]) { termLogAppendC(TERM_C_ERR, nullptr, "no public channel"); return; }
   termDoSend(true, nullptr, 0, cd.name, text);
 }
+#endif
 
 // `exit` / `leave`: drop the current recipient so bare text is a command again.
 static void termCmdExit() {
@@ -26747,7 +27432,7 @@ static bool termIsCliKeyword(const char* word, size_t len) {
   static const char* kw[] = {
     "help", "ver", "version", "clock", "time", "status", "get", "set",
     "advert", "advert.zerohop", "reboot", "wifi", "mqtt", "tcp", "ble", "ota",
-    "ok", "cancel",
+    "ok", "cancel", "info", "nodes", "contacts", "channels", "lora", "device", "position", "nodeinfo", "name", "sync", "shutdown",
   };
   for (const char* k : kw) {
     if (strlen(k) == len && strncasecmp(word, k, len) == 0) return true;
@@ -26768,15 +27453,13 @@ static bool terminalRunChatCommand(const char* cmd) {
     return false;
   };
   const char* rest = nullptr;
+#if defined(WADA_MESHTASTIC)
+  if(wadaBackend && (is(cmd,"chan",nullptr)||is(cmd,"channels",nullptr)||is(cmd,"list",nullptr)||is(cmd,"contacts",nullptr)))return false;
+#endif
   if (is(cmd, "help", &rest) || is(cmd, "?", &rest)) {   // prepend the messaging commands, then fall through to the config-CLI help
     termLogAppendC(TERM_C_INFO, nullptr, "messaging:");
     termLogAppend("  ", "list / contacts    - list your contacts");
     termLogAppend("  ", "channels           - list channels");
-    termLogAppend("  ", "chan add <name>    - new private channel (random key)");
-    termLogAppend("  ", "chan add <name> <key> - join a private channel (32 hex)");
-    termLogAppend("  ", "chan add #tag      - join a hashtag channel");
-    termLogAppend("  ", "chan del <ch>      - delete a channel (slot or name)");
-    termLogAppend("  ", "chan key <ch>      - show a channel's key");
     termLogAppend("  ", "to <name>          - talk to a contact or channel");
     termLogAppend("  ", "send <text>        - send to the current recipient");
     termLogAppend("  ", "public <text>      - send on the public channel");
@@ -26791,7 +27474,7 @@ static bool terminalRunChatCommand(const char* cmd) {
   if (is(cmd, "to", &rest))                                 { termCmdTo(rest);   return true; }
   if (is(cmd, "exit", &rest) || is(cmd, "leave", &rest))    { termCmdExit();     return true; }
   if (is(cmd, "send", &rest))                               { termCmdSend(rest); return true; }
-  if (is(cmd, "public", &rest))                             { termCmdPublic(rest); return true; }
+  if (is(cmd, "public", &rest) || is(cmd, "primary", &rest))                             { termCmdPublic(rest); return true; }
   // Room mode: once a recipient is selected, a line whose first word isn't a
   // config-CLI keyword is sent straight to that recipient as a chat message.
   // (To send text that starts with a keyword, use `send <text>`.)
@@ -26814,11 +27497,25 @@ static void terminalSubmit() {
   kbMirrorSyncToReal();   // pull the latest text out of the keyboard mirror
   const char* text = lv_textarea_get_text(s_term_input_ta);
   if (!text || !text[0]) return;
-  char cmd[128];
-  strncpy(cmd, text, sizeof(cmd) - 1);
-  cmd[sizeof(cmd) - 1] = '\0';
+  char cmd[512];
+  if (strlen(text) >= sizeof(cmd)) {
+    termLogAppendC(TERM_C_ERR, "", "Command is too long; nothing was sent");
+    return;
+  }
+#if defined(WADA_MESHTASTIC)
+  if (!wada::statusText(text, sizeof(cmd) - 1, true)) {
+    termLogAppendC(TERM_C_ERR, "", "Enter a single line of valid UTF-8; nothing was sent");
+    return;
+  }
+#endif
+  memcpy(cmd, text, strlen(text) + 1);
   termLogAppendC(TERM_C_INPUT, "> ", cmd);
-  if (!terminalRunChatCommand(cmd)) the_mesh.runLocalCli(cmd);
+  if (!terminalRunChatCommand(cmd)) {
+#if defined(WADA_MESHTASTIC)
+    if(wadaBackend && g_lv.task && (!strncasecmp(cmd,"lora ",5)||!strncasecmp(cmd,"nodeinfo interval ",18)||!strncasecmp(cmd,"position interval ",18)||!strncasecmp(cmd,"name ",5)||!strcasecmp(cmd,"reboot")||!strcasecmp(cmd,"shutdown")))g_lv.task->persistHistoryNow();
+#endif
+    the_mesh.runLocalCli(cmd);
+  }
   lv_textarea_set_text(s_term_input_ta, "");
   // Re-bind so the cleared mirror tracks the field and the next Enter submits.
   if (g_lv.keyboard) kbMirrorBind(s_term_input_ta);
@@ -27015,6 +27712,12 @@ static void webSendToThread(int tidx, const char* text) {
   bool ch = false; uint16_t unread = 0; uint32_t ts = 0; char name[48] = {0};
   if (!g_lv.task->getThreadInfo(tidx, ch, unread, ts, name, sizeof name)) return;
   if (ch) {
+#if defined(WADA_MESHTASTIC)
+    if (!g_lv.task->channelThreadAvailable(tidx)) {
+      termLogAppendC(TERM_C_ERR, nullptr, "archived or changed channel - not sent");
+      return;
+    }
+#endif
     // Resolve the channel slot by NAME at TX time, not the thread's cached slot — a stale
     // cached slot TXes on the wrong key (see [channel-send-stale-slot]).
     int16_t slot = -1;
@@ -27109,6 +27812,24 @@ static void webPushStatus() {
 }
 
 // Contact detail popup (Info action).
+#if defined(WADA_MESHTASTIC)
+static void webPushContactInfo(int cidx) {
+  ContactInfo c{};
+  if (!the_mesh.getContactByIdx((uint32_t)cidx, c) || !s_webdata_buf) return;
+  char* p = s_webdata_buf; const char* e = s_webdata_buf + WEBDATA_BUF;
+  p += snprintf(p, e - p,
+                "{\"t\":\"ci\",\"i\":%d,\"rp\":%d,\"rm\":%d,\"fav\":%d,\"ign\":%d,\"pl\":%d,\"adv\":%u,\"la\":%ld,\"lo\":%ld,\"k\":\"",
+                cidx, (c.type == ADV_TYPE_REPEATER) ? 1 : 0, (c.type == ADV_TYPE_ROOM) ? 1 : 0,
+                (wadaBackend ? (c.flags & 0x01) != 0 : touchPrefsIsFavorite(c.id.pub_key)) ? 1 : 0, touchPrefsIsIgnored(c.id.pub_key) ? 1 : 0,
+                (c.out_path_len == OUT_PATH_UNKNOWN) ? -1 : (int)pathHops(c.out_path_len),
+                (unsigned)c.last_advert_timestamp, (long)c.gps_lat, (long)c.gps_lon);
+  for (int b = 0; b < 6; ++b) p += snprintf(p, e - p, "%02x", c.id.pub_key[b]);   // short pubkey id
+  p += snprintf(p, e - p, "\",\"n\":\"");
+  jsonEsc(p, e, c.name);
+  p += snprintf(p, e - p, "\"}");
+  g_web_mirror.pushTermData(s_webdata_buf);
+}
+#else
 static void webPushContactInfo(int cidx) {
   ContactInfo c{};
   if (!the_mesh.getContactByIdx((uint32_t)cidx, c) || !s_webdata_buf) return;
@@ -27125,8 +27846,27 @@ static void webPushContactInfo(int cidx) {
   p += snprintf(p, e - p, "\"}");
   g_web_mirror.pushTermData(s_webdata_buf);
 }
+#endif
 
 // Contact mutations from the web action sheet: (f)avorite, (b)lock, reset (p)ath, delete (x). Refresh after.
+#if defined(WADA_MESHTASTIC)
+static void webContactAction(int cidx, char op) {
+  ContactInfo c{};
+  if (!the_mesh.getContactByIdx((uint32_t)cidx, c)) return;
+  switch (op) {
+    case 'f': {
+      const bool wanted = !(wadaBackend ? (c.flags & 0x01) != 0 : touchPrefsIsFavorite(c.id.pub_key));
+      if (!wadaBackend || the_mesh.uiSetContactFavorite(c.id.pub_key, wanted)) touchPrefsSetFavorite(c.id.pub_key, wanted);
+      break;
+    }
+    case 'b': touchPrefsSetIgnored(c.id.pub_key, !touchPrefsIsIgnored(c.id.pub_key));   break;
+    case 'p': the_mesh.uiResetContactPath(c.id.pub_key); break;
+    case 'x': the_mesh.uiRemoveContact(c); break;
+    default:  return;
+  }
+  webPushContacts();
+}
+#else
 static void webContactAction(int cidx, char op) {
   ContactInfo c{};
   if (!the_mesh.getContactByIdx((uint32_t)cidx, c)) return;
@@ -27139,6 +27879,7 @@ static void webContactAction(int cidx, char op) {
   }
   webPushContacts();
 }
+#endif
 
 // Discovered (heard-but-not-added) nodes -> the "add contacts without touching the device" flow.
 static void webPushDiscovered() {
@@ -28105,6 +28846,9 @@ static bool fmRmRecursive(fs::FS* fs, const char* path) {
 void luaHostTextPromptCancel();
 static bool s_fm_prompt_ok = false;
 static void fmPromptClose() {
+#if defined(WADA_MESHTASTIC)
+  wadaStatusPromptClosed();
+#endif
   if (s_fm_prompt) {
     hideKb();
     popupClose(&s_fm_prompt);
@@ -28118,6 +28862,9 @@ static void fmPromptClose() {
 // OK, from the button or from Enter in the field (handleHwKey). The text is copied
 // whole before the dialog goes: a wada.ui.input field can hold up to 2000 characters.
 static void fmPromptSubmit() {
+#if defined(WADA_MESHTASTIC)
+  if (wadaStatusSubmit()) return;
+#endif
   if (!s_fm_prompt_ta) { fmPromptClose(); return; }
   kbMirrorSyncToReal();
   const char* t = lv_textarea_get_text(s_fm_prompt_ta);
@@ -28202,6 +28949,8 @@ static void fmTextPrompt(const char* title, const char* initial, void (*cb)(cons
 
   if (g_lv.keyboard) kbMirrorBind(s_fm_prompt_ta);
 }
+
+#include "WadaStatusEditor.inc"
 
 // ----- contact nickname editor (Contact options > Nickname) -----
 static uint8_t s_nick_edit_key[6];
@@ -29041,7 +29790,7 @@ static void fmOpenImage(const char* name) {
 }
 
 // ----- row interaction -----
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
 static void openReaderPage(const char* initial_url);   // the Reader, further down
 // A document on the card opens in the Reader: HTML always (its links work there, so a
 // folder of pages is browsable offline), and plain text or markdown too big for the
@@ -29749,6 +30498,10 @@ static void sigProbeNowCb(lv_event_t* e) {
   g_lv.task->showAlert(TR("Probing neighbours\xE2\x80\xA6"), 900);
 }
 static void openSignalInfoPopup() {
+#if defined(WADA_MESHTASTIC)
+  openSettingsCategory(CAT_RADIO);
+  return;
+#endif
   closeSigInfoPopup();
   lv_coord_t sw = lv_disp_get_hor_res(nullptr);
   lv_coord_t sh = lv_disp_get_ver_res(nullptr);
@@ -30009,7 +30762,7 @@ static void openSignalInfoPopup() {
 // client (the ask: an "apocalyptic" browser — on-device only, nothing leaves the
 // device to a third party). No JS / CSS / images by design. All network + parse work
 // runs on a core-0 worker task so LVGL never blocks; the UI loop polls s_reader_dirty.
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
 static const char    kReaderDefaultUrl[] = "wadamesh.com";
 static const char    kReaderHomeUrl[] = "sd:/home.htm";
 // Online with no SD home page: what changed in each build, newest first (#622). The site
@@ -31175,6 +31928,10 @@ static void closeDiscoverPage() {
 }
 
 static void openDiscoverPage() {
+#if defined(WADA_MESHTASTIC)
+  openSettingsCategory(CAT_NODEINFO);
+  return;
+#endif
   closeDiscoverPage();
   const lv_coord_t sw = lv_disp_get_hor_res(nullptr);
   const lv_coord_t sh = lv_disp_get_ver_res(nullptr);
@@ -34003,13 +34760,15 @@ static void openSpectrumPage() {
 // mesh is paused (the_mesh.loop() skipped) and never re-tunes mid-sweep.
 bool spectrumOwnsRadio() { return s_spectrum_active; }
 
-// Status-bar unread badge (✉ N) → Chats inbox. Wired on the bar's left_label;
-// only fires while updateGlobalStatusBar has flagged the badge state CLICKABLE,
-// so non-badge left-zone states keep the bar's control-center / Back tap.
+// The unread badge opens Chats; the native Home identity name opens its context menu.
+// Other left-zone states keep the bar's control-center / Back tap.
 static void statusBarUnreadCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   if (s_apppage_close)  { s_apppage_close(); return; }       // tool-page title bar: tap/Enter = back
   if (s_settings_sheet) { closeSettingsCategory(); return; } // settings detail "‹ Title": tap/Enter = back
+#if defined(WADA_MESHTASTIC)
+  if (s_native_identity_name) { wadaOwnIdentityMenu(); return; }
+#endif
   goToTab(CHAT_INBOX_TAB_INDEX);
 }
 
@@ -34418,8 +35177,8 @@ static void openContactsOverflowSheetCb(lv_event_t* e) {
   };
   mk(TR(LV_SYMBOL_EYE_OPEN "  Search"), contactsOverflowSearchCb, 0);
   mk(TR(LV_SYMBOL_LIST     "  Discovered"), contactsOverflowFoundCb, 0);
-  mk(TR(LV_SYMBOL_PLUS     "  Add contact"), contactsOverflowAddCb, 0);
-  mk(TR(LV_SYMBOL_DOWNLOAD "  Contact Management"), contactsOverflowAutoAddCb, 0);
+  mk(TR(LV_SYMBOL_PLUS     "  Find node by ID"), contactsOverflowAddCb, 0);
+  mk(TR(LV_SYMBOL_DOWNLOAD "  Node database"), contactsOverflowAutoAddCb, 0);
   mk(TR(LV_SYMBOL_CLOSE    "  Blocked list"), contactsOverflowBlockedCb, 0);
 }
 
@@ -34450,15 +35209,29 @@ static lv_obj_t* s_ct_filter_btns[7] = { nullptr, nullptr, nullptr, nullptr, nul
 static lv_obj_t* s_ct_filter_btn_lbl = nullptr;   // header Filter button label (shows the active filter)
 static lv_obj_t* s_ct_disc_badge     = nullptr;   // count badge on the header Discovered button
 static const char* contactsFilterShortLabel() {
+  const char* label = "All";
   switch (g_lv.contacts_filter) {
-    case 1u: return "RPT";  case 2u: return "Peer"; case 3u: return "Fav"; case 4u: return "Loc"; case 5u: return "Dir"; case 6u: return "Room";
-    default: return "All";
+    case 1u: label = "RPT"; break; case 2u: label = "Peer"; break;
+    case 3u: label = "Fav"; break; case 4u: label = "Loc"; break;
+    case 5u: label = "Dir"; break; case 6u: label = "Room"; break;
+    default: break;
   }
+#if defined(WADA_MESHTASTIC)
+  const bool unheard = s_native_hide_unheard && wadaBackend && wadaBackend->nodeSnapshotReady() && wadaBackend->reportsHeardOnCurrentLora();
+  const unsigned extra = unsigned(unheard) + unsigned(s_native_nodes_signed) + unsigned(s_native_nodes_encrypted);
+  if (extra) {
+    static char combined[24];
+    if (extra > 1) snprintf(combined, sizeof(combined), "%s +%u", label, extra);
+    else snprintf(combined, sizeof(combined), "%s%s", label, unheard ? " +LoRa" : s_native_nodes_signed ? " +Sig" : " +Key");
+    return combined;
+  }
+#endif
+  return label;
 }
 // Bulk-delete runs chunked across loop ticks, so the UI repaints and the watchdog
 // is fed between removals. The contacts file is written once, at the end.
 static bool         s_ctd_active  = false;
-static int          s_ctd_total   = 0, s_ctd_done = 0;
+static int          s_ctd_total   = 0, s_ctd_done = 0, s_ctd_queued = 0;
 static uint8_t    (*s_ctd_keys)[PUB_KEY_SIZE] = nullptr;   // full keys to delete; allocated per run
 static lv_obj_t*    s_ctd_overlay = nullptr;   // progress modal
 static lv_obj_t*    s_ctd_bar     = nullptr;
@@ -34477,14 +35250,45 @@ static bool ctSearchNeedle(char* out, int outsz){
   out[n]='\0'; return true;
 }
 // Shared predicate so the rendered list and Select-all use IDENTICAL rules.
+#if defined(WADA_MESHTASTIC)
+static const meshtastic_NodeInfo *wadaNodeForContact(const ContactInfo &contact) {
+  return wadaBackend ? wadaBackend->nodeInfo(WadaMeshtasticBackend::keyNode(contact.id.pub_key)) : nullptr;
+}
+static bool wadaDirectContact(const ContactInfo &contact) {
+  const auto *node = wadaNodeForContact(contact);
+  return node && node->has_hops_away && node->hops_away == 0 && !node->via_mqtt;
+}
+static const char *wadaRoleLabel(unsigned role) {
+  static constexpr const char *names[] = {"Client", "Client mute", "Router", "Router client", "Repeater", "Tracker", "Sensor", "TAK", "Client hidden", "Lost and found", "TAK tracker", "Router late", "Client base"};
+  static_assert(sizeof(names) / sizeof(*names) == _meshtastic_Config_DeviceConfig_Role_ARRAYSIZE, "Update native role labels");
+  return role < sizeof(names) / sizeof(*names) ? TR(names[role]) : TR("Node");
+}
+#endif
 static bool ctPassesFilter(const ContactInfo& c, bool is_fav, int fav_count, const char* needle){
+#if defined(WADA_MESHTASTIC)
+  const uint32_t number = WadaMeshtasticBackend::keyNode(c.id.pub_key);
+  if (!wadaNodeListAllowsNode(number)) return false;
+  if (s_native_hide_unheard && wadaBackend && wadaBackend->unheardOnCurrentLora(number)) return false;
+#endif
   const bool is_rep = (c.type == ADV_TYPE_REPEATER);
   switch(g_lv.contacts_filter){
     case 1u: if(!is_rep) return false; break;                              // repeaters
     case 2u: if(is_rep || c.type == ADV_TYPE_ROOM) return false; break;   // peers: rooms have their own filter (6)
-    case 3u: if(fav_count>0 && !is_fav) return false; break;               // favorites
+    case 3u:
+#if defined(WADA_MESHTASTIC)
+      if (!is_fav) return false;
+#else
+      if(fav_count>0 && !is_fav) return false;
+#endif
+      break;               // favorites
     case 4u: if(!(c.gps_lat!=0 || c.gps_lon!=0)) return false; break;      // has location
-    case 5u: if (pathHops(c.out_path_len) != 0) return false; break;                  // 0-hop / direct neighbors only
+    case 5u:
+#if defined(WADA_MESHTASTIC)
+      if (!wadaDirectContact(c)) return false;
+#else
+      if (pathHops(c.out_path_len) != 0) return false;
+#endif
+      break;                  // 0-hop / direct neighbors only
     case 6u: if (c.type != ADV_TYPE_ROOM) return false; break;             // room servers
     default: break;                                                        // 0 = all
   }
@@ -34599,7 +35403,11 @@ static void ctSelectAllFiltered(){
     ContactInfo c;
     if(!the_mesh.getContactByIdx((uint32_t)i,c) || !c.name[0]) continue;
 #if defined(ESP32)
+#if defined(WADA_MESHTASTIC)
+    const bool is_fav = wadaContactIsFavorite(c);
+#else
     const bool is_fav = touchPrefsFavoritesSnapshotContains(fav_buf, fav_count, c.id.pub_key);
+#endif
 #else
     const bool is_fav = false;
 #endif
@@ -34639,7 +35447,11 @@ static void ctDeleteProgressOpen(){
   lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
   lv_obj_t* ttl = lv_label_create(card);
+#if defined(WADA_MESHTASTIC)
+  lv_label_set_text(ttl, TR("Requesting node removal"));
+#else
   lv_label_set_text(ttl, TR("Deleting contacts"));
+#endif
   lv_obj_set_style_text_color(ttl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
   lv_obj_set_style_text_font(ttl, &g_font_14, LV_PART_MAIN);
   lv_obj_align(ttl, LV_ALIGN_TOP_LEFT, 0, 0);
@@ -34666,7 +35478,7 @@ static void ctDeleteServiceTick(){
   if(!s_ctd_active) return;
   const int BATCH = 8;   // no flash rewrite per contact now, so a bigger bite
   for(int b=0; b<BATCH && s_ctd_done < s_ctd_total; ++b){
-    if(s_ctd_keys) the_mesh.uiRemoveContactNoSave(s_ctd_keys[s_ctd_done]);   // lookup-by-pubkey: shift-safe
+    if(s_ctd_keys && the_mesh.uiRemoveContactNoSave(s_ctd_keys[s_ctd_done])) ++s_ctd_queued;   // keys remain stable until confirmation
     ++s_ctd_done;
   }
   g_lv.dirty_threads = false;   // don't let the bulk delete trigger per-tick list rebuilds
@@ -34678,7 +35490,15 @@ static void ctDeleteServiceTick(){
     the_mesh.uiPersistContacts();   // one /contacts3 rewrite for the whole run
     if(s_ctd_keys){ heap_caps_free(s_ctd_keys); s_ctd_keys = nullptr; }
     ctDeleteProgressClose();
-    if(g_lv.task){ char msg[32]; snprintf(msg,sizeof msg, TR("Deleted %d"), total); g_lv.task->showAlert(msg, 1200); }
+    if(g_lv.task) {
+      char msg[96];
+#if defined(WADA_MESHTASTIC)
+      snprintf(msg, sizeof msg, TR("Removal requests: %d. Not queued: %d."), s_ctd_queued, total - s_ctd_queued);
+#else
+      snprintf(msg, sizeof msg, TR("Deleted %d"), total);
+#endif
+      g_lv.task->showAlert(msg, 2200);
+    }
     g_lv.dirty_threads = true;   // one refresh now that we're done
     ctSetSelectMode(false);      // exit select mode + rebuild the (now shorter) list
     if(g_lv.task) g_lv.task->onThreadsChanged();   // nudge web clients to refetch
@@ -34791,7 +35611,7 @@ static void ctDoDelete(){
       memcpy(s_ctd_keys[n++], c.id.pub_key, PUB_KEY_SIZE);   // snapshot first (delete shifts indices)
   }
   if(n==0){ heap_caps_free(s_ctd_keys); s_ctd_keys = nullptr; ctSetSelectMode(false); return; }
-  s_ctd_total = n; s_ctd_done = 0; s_ctd_active = true;
+  s_ctd_total = n; s_ctd_done = s_ctd_queued = 0; s_ctd_active = true;
   ctDeleteProgressOpen();   // the loop tick does the actual deletion + advances the bar
 }
 
@@ -34805,6 +35625,7 @@ static void ctDeleteSelCb(lv_event_t* e){
 }
 
 static void ctSortSheetClose(){ if(s_ct_sort_sheet){ popupClose(&s_ct_sort_sheet); } }
+#include "WadaNativeClear.inc"
 // X badge handler: close UNCONDITIONALLY. (The backdrop cb below only closes when
 // the tap target is the backdrop itself — correct for the backdrop, but that guard
 // made the close-X a no-op when its tap registered on the badge's glyph child.)
@@ -34968,12 +35789,22 @@ static void openContactsFilterSheet(){
   for(int i=0;i<CONTACTS_SORT_COUNT;++i) s_ct_sort_btns[i]=nullptr;     // the sort sheet's buttons are gone now
   lv_obj_t* card = ctOpenOptionSheet("Filter");
   s_ct_filter_btns[0] = ctSheetOption(card, "All",            ctFilterOptCb, 0, g_lv.contacts_filter==0);
+#if !defined(WADA_MESHTASTIC)
   s_ct_filter_btns[1] = ctSheetOption(card, "Repeaters",      ctFilterOptCb, 1, g_lv.contacts_filter==1);
   s_ct_filter_btns[6] = ctSheetOption(card, TR("Rooms"),          ctFilterOptCb, 6, g_lv.contacts_filter==6);   // listed by type, value stays 6
   s_ct_filter_btns[2] = ctSheetOption(card, TR("Peers"),          ctFilterOptCb, 2, g_lv.contacts_filter==2);
+#endif
   s_ct_filter_btns[3] = ctSheetOption(card, TR("Favorites"),      ctFilterOptCb, 3, g_lv.contacts_filter==3);
   s_ct_filter_btns[4] = ctSheetOption(card, TR("Has location"),   ctFilterOptCb, 4, g_lv.contacts_filter==4);
   s_ct_filter_btns[5] = ctSheetOption(card, TR("Direct (0-hop)"), ctFilterOptCb, 5, g_lv.contacts_filter==5);
+#if defined(WADA_MESHTASTIC)
+  ctSheetOption(card, "Signed nodes only", wadaSecurityFilterCb, 1, s_native_nodes_signed);
+  ctSheetOption(card, "Encrypted only", wadaSecurityFilterCb, 2, s_native_nodes_encrypted);
+  if (wadaBackend && wadaBackend->reportsHeardOnCurrentLora() && wadaBackend->nodeSnapshotReady()) {
+    auto* hide = ctSheetOption(card, "Hide unheard nodes", wadaHideUnheardCb, 0, s_native_hide_unheard);
+    navSetTip(hide, TR("Hide nodes not heard on your current LoRa settings"));
+  }
+#endif
 }
 static void openContactsFilterSheetCb(lv_event_t* e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED) openContactsFilterSheet(); }
 
@@ -34988,13 +35819,18 @@ static lv_event_t* ctClickEvent() {
 // The Contacts ⋯ menu: what the old overflow sheet and the trash button held.
 static void contactsMoreCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  const ActItem items[] = {
-    { UI_ICON_USER_PLUS,   TR("Add contact"),       []{ openAddContactModalCb(ctClickEvent()); },  false },
-    { UI_ICON_LIST_CHECKS, TR("Select to delete"),  []{ ctSetSelectMode(true); },                   false },
-    { LV_SYMBOL_SETTINGS,  TR("Contact Management"), []{ openSettingsCategory(CAT_AUTOADD); },      false },
-    { UI_ICON_BAN,         TR("Blocked users"),     []{ openBlockedUsersModal(); },                 false },
-  };
-  openActionList(TR("Contacts"), items, (int)(sizeof items / sizeof items[0]));
+  ActItem items[7];
+  int count = 0;
+  items[count++] = { UI_ICON_USER_PLUS, TR("Find node by ID"), []{ openAddContactModalCb(ctClickEvent()); }, false };
+  items[count++] = { UI_ICON_LIST_CHECKS, TR("Select to delete"), []{ ctSetSelectMode(true); }, false };
+  items[count++] = { LV_SYMBOL_SETTINGS, TR("Node database"), []{ openSettingsCategory(CAT_AUTOADD); }, false };
+  items[count++] = { UI_ICON_BAN, TR("Blocked users"), []{ openBlockedUsersModal(); }, false };
+#if defined(WADA_MESHTASTIC)
+  items[count++] = { UI_ICON_SHIELD_CHECK, TR("Security"), wadaSecurityLegend, false };
+  if (wadaBackend && wadaBackend->nodeSnapshotReady() && wadaBackend->reportsHeardOnCurrentLora())
+    items[count++] = { UI_ICON_RADIO_TOWER, TR("Clear unheard nodes"), wadaConfirmClearUnheard, true };
+#endif
+  openActionList(TR("Contacts"), items, count);
 }
 
 static void makeContactsTab(lv_obj_t* tab) {
@@ -35065,7 +35901,7 @@ static void makeContactsTab(lv_obj_t* tab) {
   }
   {   // Discovered: heard nodes not in the contacts yet, with their count
     lv_obj_t* b = chatsIconBtn(row, UI_ICON_RADAR, contactsOverflowFoundCb);
-    navSetTip(b, TR("Discovered nodes"));
+    navSetTip(b, TR("Request nearby node info"));
     lv_obj_add_flag(b, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
     s_ct_disc_badge = lv_label_create(b);   // updated by the loop: text + shown while > 0
     lv_obj_set_size(s_ct_disc_badge, LV_SIZE_CONTENT, 14);   // 8 px figures, 3 px above: centred
@@ -35277,7 +36113,7 @@ static void mapSdWriteFailed() {
 static fs::FS*        s_tile_fs_default   = nullptr;
 static char           s_tile_root_default[16] = "";
 
-#if defined(MULTI_TRANSPORT_COMPANION)
+#if defined(WADA_NETWORK_UI)
 // The fetch queue may contain dozens of requests, but only the request currently
 // executing can dereference s_tile_fs or own a File. A backend swap requests a
 // boundary pause, waits only for that one request, then lets the queued backlog
@@ -35474,7 +36310,7 @@ static bool tilesFsLowSpace() {
 // OSM tile-usage policy compliance: identifying User-Agent header,
 // ~2 req/sec rate cap, no bulk downloads. Each tile is ~10-30 KB; the
 // 4.75 MB partition holds a couple hundred.
-#if defined(MULTI_TRANSPORT_COMPANION)
+#if defined(WADA_NETWORK_UI)
 struct TileFetchReq { uint8_t z; int32_t x; int32_t y; };
 static constexpr int     k_tile_fetch_queue_size = 64;   // holds a full zoomed-out prefetch pyramid + the visible grid in one pass
 static QueueHandle_t     s_tile_fetch_queue   = nullptr;
@@ -35908,7 +36744,7 @@ worldPxToLatLon(double world_x, double world_y, uint8_t zoom,
 // tile from OSM, writes it to LittleFS. Pinned to core 0 (Wi-Fi core)
 // so the LVGL thread on core 1 isn't blocked by network I/O. Self-
 // terminates after a 5 s idle period to release the stack.
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
 static void ensureTilesDirPath(uint8_t z, int32_t x, const char* root) {
   // LittleFS requires explicit mkdir; opening a deep path won't auto-create the
   // parents. `root` is /tiles (OSM) or /tiles/topo (OpenTopoMap) — for topo the
@@ -36795,7 +37631,7 @@ static bool reportPostWorker(WiFiClient& client, HTTPClient& http,
                          "application/json") >= 0;
 }
 
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION) && CAP_OTA
+#if defined(ESP32) && defined(WADA_NETWORK_UI) && CAP_OTA
 // Per-board OTA download bin name (the app-only <name>.bin under releases/<ch>/beta_<N>/).
 // MUST match the release artifact names exactly. Every touch board is dual-slot OTA-capable
 // (CAP_OTA=1 + app0/app1 partitions + FIRMWARE_OTA_ENV) EXCEPT the Tanmatsu (AppFS/launcher,
@@ -36871,7 +37707,7 @@ static void otaWorkerRun(WiFiClient& client, HTTPClient& http) {
   s_ota_state = 2;   // success -> the UI poll timer reboots into the new slot
 }
 
-#if CAP_SD && defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION) && CAP_OTA
+#if CAP_SD && defined(ESP32) && defined(WADA_NETWORK_UI) && CAP_OTA
 // Stream the app-only bin for the active update channel onto the SD card
 // (/BINS/wadamesh-beta_<N>-<stable|beta>.bin) so the Launcher can flash it —
 // the no-A/B-slot counterpart to otaWorkerRun above. Same immutable versioned
@@ -37218,14 +38054,14 @@ static void tileFetchTaskFn(void* arg) {
       continue;
     }
 #endif
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION) && CAP_OTA
+#if defined(ESP32) && defined(WADA_NETWORK_UI) && CAP_OTA
     // Wi-Fi OTA self-update (user-initiated from About). Reuses this worker's stack + client.
     if (s_ota_request) {
       s_ota_request = false;
       otaWorkerRun(client, http);
       continue;
     }
-#if CAP_SD && defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION) && CAP_OTA
+#if CAP_SD && defined(ESP32) && defined(WADA_NETWORK_UI) && CAP_OTA
     // SD firmware download for Launcher installs (user-initiated from About).
     if (s_sdfw_request) {
       s_sdfw_request = false;
@@ -37243,7 +38079,11 @@ static void tileFetchTaskFn(void* arg) {
       // then OOM-panic (BLE-vs-Wi-Fi mutex, see main.cpp). wantsWifi() mirrors the boot
       // transport choice: true only when Wi-Fi is the active transport.
       if (!wifiConfigWantsWifi()) { s_wifiscan_done = true; continue; }
-#if defined(TLORA_PAGER)
+#if defined(WADA_MESHTASTIC)
+      // Firmware owns starting/stopping STA. A UI scan cannot allocate its driver.
+      if ((WiFi.getMode() & WIFI_MODE_STA) == 0) {s_wifiscan_done=true;continue;}
+      vTaskDelay(pdMS_TO_TICKS(40));
+#elif defined(TLORA_PAGER)
       // Cold STA allocation is order-sensitive with NimBLE on the Pager and is
       // owned exclusively by main.cpp. If the driver disappeared after the UI
       // released this request, fail the sweep instead of initializing it here.
@@ -38174,7 +39014,7 @@ static bool loadTileJpeg(uint8_t z, int32_t x, int32_t y,
          bufsd[nsd - 2] != 0xFF || bufsd[nsd - 1] != 0xD9)) {
       lvglPsramFree(bufsd);
       map_sd->remove(path);
-#if defined(MULTI_TRANSPORT_COMPANION)
+#if defined(WADA_NETWORK_UI)
       tileFetchForget(z, x, y);
 #endif
       return false;
@@ -38221,7 +39061,7 @@ static bool loadTileJpeg(uint8_t z, int32_t x, int32_t y,
       buf[n - 2] != 0xFF || buf[n - 1] != 0xD9) {
     lvglPsramFree(buf);
     tileCacheRemove(path);
-#if defined(MULTI_TRANSPORT_COMPANION)
+#if defined(WADA_NETWORK_UI)
     tileFetchForget(z, x, y);
 #endif
     return false;
@@ -38244,13 +39084,13 @@ static bool loadTileJpeg(uint8_t z, int32_t x, int32_t y,
 // every ancestor of a 3x3 grid (at most 4 per level); PSRAM, zeroed = empty.
 typedef MapOverzoom::MissRing<16> MapOvzMissRing;
 static MapOvzMissRing* s_map_ovz_miss = (MapOvzMissRing*)psAlloc(sizeof(MapOvzMissRing));
-#if defined(MULTI_TRANSPORT_COMPANION)
+#if defined(WADA_NETWORK_UI)
 static uint16_t s_map_ovz_miss_ok = 0;   // s_tile_fetch_ok when the ring was last known good
 #endif
 // Can a download still bring a tile that is not on storage? Then the map waits for it,
 // as before, rather than drawing a stand-in the arriving tile would have to replace.
 static bool mapTileFetchCanFill() {
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
   return WiFi.status() == WL_CONNECTED;
 #else
   return false;
@@ -38263,7 +39103,7 @@ static bool mapTileFetchCanFill() {
 static int mapOverzoomInto(uint8_t z, int32_t x, int32_t y, uint8_t* buf, size_t cap) {
   constexpr int T = MapOverzoom::kTile;
   if (!buf || cap < (size_t)T * T * sizeof(lv_color_t)) return 0;
-#if defined(MULTI_TRANSPORT_COMPANION)
+#if defined(WADA_NETWORK_UI)
   if (!s_map_ovz_miss) return 0;
   if (s_map_ovz_miss_ok != s_tile_fetch_ok) { s_map_ovz_miss->clear(); s_map_ovz_miss_ok = s_tile_fetch_ok; }
 #endif
@@ -38765,7 +39605,7 @@ static void renderMapTiles() {
     uint8_t  ovz = 0;
     if (!loadTileJpeg(s_map_zoom, wanted[i].tx, wanted[i].ty,
                       &jpeg, &jlen, &repairable_cache)) {
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
       // Tile not on disk — queue an OSM download if Wi-Fi is up. No-op
       // when offline; if/when Wi-Fi comes up later, the next render
       // pass will queue again.
@@ -38793,7 +39633,7 @@ static void renderMapTiles() {
       lvglPsramFree(jpeg);
     }
     if (!rgb) {
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
       if (repairable_cache) {
         char bad_path[48];
         snprintf(bad_path, sizeof(bad_path), "%s/%u/%ld/%ld.jpg",
@@ -38898,7 +39738,7 @@ static void renderMapTiles() {
   { int placed = 0; for (int i = 0; i < n_wanted; ++i) if (wanted[i].placed) ++placed;
     s_tile_dec_ok = placed; }
 
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
   // Warm the min/max zoom cache for this location (overview + detail) in the
   // background. Queued after the visible tiles above so they keep priority.
   queueZoomPackForCenter();
@@ -38918,7 +39758,7 @@ static void renderMapTiles() {
   s_map_last_missing = n_missing;
 
   bool wifi_up = false;
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
   wifi_up = (WiFi.status() == WL_CONNECTED);
 #endif
 
@@ -38982,7 +39822,7 @@ static void renderMapTiles() {
     // non-200 "http" (e.g. 301 = HTTP→HTTPS redirect the device can't follow,
     // 403/-1 = blocked/connect fail) means the server/proxy path is the problem,
     // not the on-device renderer.
-#if defined(MULTI_TRANSPORT_COMPANION)
+#if defined(WADA_NETWORK_UI)
     char dl[288];
     snprintf(dl, sizeof dl,
         "Downloading map tiles\xe2\x80\xa6  (%s)\n"
@@ -39294,7 +40134,7 @@ void luaHostMapRender(void* vp) {
     uint8_t* rgb = nullptr;
     bool ovz = false;
     if (!loadTileJpeg(v->zoom, wanted[k].tx, wanted[k].ty, &enc, &elen, &repairable) || !enc) {
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
       queueTileForFetch(v->zoom, wanted[k].tx, wanted[k].ty);   // fills in if Wi-Fi is up
 #endif
 #if CAP_MAP_OVERZOOM
@@ -39523,12 +40363,22 @@ static void renderMapMarkers() {
   const int mm_fav_n = s_map_fav_only ? touchPrefsCopyFavorites(s_mm_fav) : 0;
 #endif
   auto mapHidesContact = [&](const ContactInfo& c) -> bool {
+#if defined(WADA_MESHTASTIC)
+    const uint32_t number = WadaMeshtasticBackend::keyNode(c.id.pub_key);
+    if (!wadaMapAllowsNode(number)) return true;
+    if (s_map_direct_only && !wadaDirectContact(c)) return true;
+#else
     if (s_map_direct_only && pathHops(c.out_path_len) != 0) return true;
+#endif
 #if defined(ESP32)
     if (s_map_fav_only) {
+#if defined(WADA_MESHTASTIC)
+      return !wadaContactIsFavorite(c);
+#else
       for (int f = 0; f < mm_fav_n; ++f)
         if (memcmp(&s_mm_fav[f * TOUCH_FAVORITE_KEY_BYTES], c.id.pub_key, TOUCH_FAVORITE_KEY_BYTES) == 0) return false;
       return true;
+#endif
     }
 #endif
     return false;
@@ -40069,7 +40919,7 @@ static void mapOptTopoCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
   const bool topo = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
   s_map_style = topo ? 1 : 0;
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
   touchPrefsSetMapStyle(s_map_style);
   memset(s_tile_fetch_dedup, 0, sizeof(s_tile_fetch_dedup));   // shared (z,x,y) ring → forget so the new style re-fetches
   s_tile_fetch_dedup_head = 0;
@@ -40128,6 +40978,18 @@ static void mapOptContactsCb(lv_event_t* e) {
 #endif
   renderMapMarkers();   // add/remove the contact markers (+ their links)
 }
+#if defined(WADA_MESHTASTIC)
+static void wadaMapSignedCb(lv_event_t* event) {
+  if (lv_event_get_code(event) != LV_EVENT_VALUE_CHANGED) return;
+  s_native_map_signed = lv_obj_has_state(lv_event_get_target(event), LV_STATE_CHECKED);
+  renderMapMarkers();
+}
+static void wadaMapEncryptedCb(lv_event_t* event) {
+  if (lv_event_get_code(event) != LV_EVENT_VALUE_CHANGED) return;
+  s_native_map_encrypted = lv_obj_has_state(lv_event_get_target(event), LV_STATE_CHECKED);
+  renderMapMarkers();
+}
+#endif
 static void mapOptDirectOnlyCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
   s_map_direct_only = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
@@ -40378,7 +41240,7 @@ static void mapOptZoomFitCb(lv_event_t* e) {
 // and re-queue them for download, so a corrupted/partial tile in view can be
 // repaired without wiping the whole pack. Bounded to the 9 on-screen tiles at
 // the current zoom (NOT a bulk area download — stays OSM-policy-friendly).
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
 static void mapReloadVisibleTiles() {
   if (s_map_center_lat == 0.0 && s_map_center_lon == 0.0) {
     if (g_lv.task) g_lv.task->showAlert(TR("Set your location first"), 1600);
@@ -40460,7 +41322,7 @@ static void mapOptMarkerCapCb(lv_event_t* e) {
 static void mapOptReloadCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   closeMapOptions();
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
   mapReloadVisibleTiles();
 #else
   if (g_lv.task) g_lv.task->showAlert(TR("Tile reload needs Wi-Fi build"), 1800);
@@ -40700,6 +41562,10 @@ static void openMapOptions() {
       { "Show contacts",       s_map_show_contacts, mapOptContactsCb   },
       { "Direct (0-hop) only", s_map_direct_only,   mapOptDirectOnlyCb },
       { "Favorites only",      s_map_fav_only,      mapOptFavOnlyCb    },
+#if defined(WADA_MESHTASTIC)
+      { "Signed nodes only", s_native_map_signed, wadaMapSignedCb },
+      { "Encrypted only", s_native_map_encrypted, wadaMapEncryptedCb },
+#endif
 #if CAP_TRACKS
       { "Record track",        trackRecording(),    mapOptTrackCb      },
 #endif
@@ -40784,6 +41650,10 @@ static void mapOpenOptionsCb(lv_event_t* e) {
 // telemetry, range test, etc. — without us duplicating UI.
 static void openMarkerPopupForContact(int mesh_idx) {
   if (mesh_idx < 0) {
+#if defined(WADA_MESHTASTIC)
+    if (wadaBackend) { wadaMenuNode = wadaBackend->nodeNumber(); wadaNodeDetails(); }
+    return;
+#endif
     // Self marker — show a small toast with our coords. Cheaper than a
     // full popup; the user already has their own profile screen.
     if (g_lv.task) {
@@ -41444,7 +42314,7 @@ static bool mapZoomReachable(uint8_t z) {
   const long tx = (long)floor(wx / 256.0);
   const long ty = (long)floor(wy / 256.0);
   if (tileExistsAt(z, tx, ty)) return true;   // SD /maps/osm pack OR LittleFS /tiles
-#if defined(MULTI_TRANSPORT_COMPANION)
+#if defined(WADA_NETWORK_UI)
   if (WiFi.status() == WL_CONNECTED) return true;   // renderMapTiles will fetch it
 #endif
   return false;
@@ -41773,7 +42643,7 @@ static void mapFollowToggleCb(lv_event_t* e) {
 // Recenters on self GPS and rebuilds the tile grid. Called from tabChangedCb
 // every time the user switches TO the Map tab.
 static void onMapTabActivated() {
-#if defined(MULTI_TRANSPORT_COMPANION)
+#if defined(WADA_NETWORK_UI)
   // Fresh fetch slate each map open: forget the "recently queued" dedup ring so
   // tiles that failed or were dropped on a previous visit get another chance
   // (the fetch task still skips anything already on disk). Without this a level
@@ -42351,7 +43221,7 @@ static void refreshMapInfoLabel() {
   //   • gaps but Wi-Fi is down     -> "Wi-Fi off"
   // Otherwise show the usual marker count.
   char tail[48];
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
   const bool wifi_up = (WiFi.status() == WL_CONNECTED);
   if (tileFetchPendingLoad() > 0) {
     snprintf(tail, sizeof(tail), "\xe2\x86\x93 %u downloading",
@@ -42395,7 +43265,7 @@ static void refreshMapInfoLabel() {
       const long ty = (long)floor(cwy / 256.0);
       char zbuf[120];
       bool force_show = false;
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
       if (s_map_tile_debug) {
         // Developer tile-pipeline diagnostic (Map options → "Tile debug overlay").
         // Serial is unreadable on the companion build, so this two-line overlay is
@@ -43582,7 +44452,7 @@ static void buildAboutSettings() {
     lv_obj_set_style_text_font(s_update_about_lbl, &g_font_14, LV_PART_MAIN);
     lv_obj_set_style_pad_left(s_update_about_lbl, 2, LV_PART_MAIN);
     lv_label_set_text(s_update_about_lbl, "");
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
     // Install over the air: a tagged build with a spare slot only. The callback checks
     // again (Wi-Fi up, update known) and reports in the status line under it.
     if (FIRMWARE_OTA_ENV[0] && firmwareReleaseN() >= 0 && touchHasOtaUpdateSlot()) {
@@ -43666,8 +44536,20 @@ static void buildAboutSettings() {
   versionCheckUpdateUi();
 }
 
+
 static void settingsCatBuild(int cat) {
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(WADA_MESHTASTIC)
+  if (wadaBackend) {
+    if (cat == CAT_RADIO) { wadaBuildRadioSettings(); return; }
+    if (cat == CAT_WIFI) { wadaBuildWifiSettings(); return; }
+    if (cat == CAT_BLUETOOTH) { wadaBuildBluetoothSettings(); return; }
+    if (cat == CAT_CHANNELS) { wadaBuildChannelSettings(); return; }
+    if (cat == CAT_NODEINFO) { wadaBuildNodeInfoSettings(); return; }
+    if (cat == CAT_AUTOADD) { wadaBuildNodeSettings(); return; }
+    if (cat == CAT_GPS) { wadaBuildPositionSettings(); return; }
+  }
+#endif
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
   s_wifi_list_cont = nullptr;   // previous page's content was cleaned; buildWifiSettings re-sets it
 #endif
   switch (cat) {
@@ -43739,7 +44621,7 @@ static void closeSettingsCategory() {
   if (s_settings_open_cat == CAT_DEVICE) {   // null the live-label ptrs (freed with the sheet)
     s_device_hw_lbl = nullptr;
     s_update_about_lbl = nullptr; s_ota_status_lbl = nullptr;
-#if CAP_SD && defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION) && CAP_OTA
+#if CAP_SD && defined(ESP32) && defined(WADA_NETWORK_UI) && CAP_OTA
     s_sdfw_status_lbl = nullptr;
 #endif
     s_ota_btn = nullptr; s_ota_btn_lbl = nullptr;
@@ -43919,7 +44801,11 @@ static const SettingsGroupDef kSettingsGroups[] = {
   // Device leads on its own, untitled (#596): its state names the hardware, so a
   // wrongly-set variant is visible before anyone opens a page.
   { "",            { CAT_DEVICE }, 1 },
+#if defined(WADA_MESHTASTIC)
+  { "Mesh",        { CAT_PROFILE, CAT_RADIO, CAT_CHANNELS, CAT_NODEINFO, CAT_AUTOADD, CAT_QUICKREPLIES }, 6 },
+#else
   { "Mesh",        { CAT_PROFILE, CAT_RADIO, CAT_AUTOADD, CAT_QUICKREPLIES }, 4 },
+#endif
   { "Connections", { CAT_WIFI, CAT_BLUETOOTH, CAT_GPS, CAT_MQTT }, 4 },
   { "Display & lock", { CAT_DISPLAY, CAT_THEME, CAT_LOCK, CAT_SOUND, CAT_KEYBOARD, CAT_LANGUAGE,
                      CAT_CLOCK, CAT_BATTERY, CAT_SENSORS }, 9 },
@@ -43938,7 +44824,7 @@ static uint32_t settingsCatHue(int c) {
     return lookRainbow(at, k);
   }
   switch (c) {
-    case CAT_RADIO:                                        return COLOR_HUE[HUE_RADIO];
+    case CAT_RADIO: case CAT_CHANNELS: case CAT_NODEINFO: return COLOR_HUE[HUE_RADIO];
     case CAT_PROFILE: case CAT_AUTOADD: case CAT_QUICKREPLIES: return COLOR_HUE[HUE_MSG];
     case CAT_WIFI: case CAT_BLUETOOTH: case CAT_GPS: case CAT_MQTT: return COLOR_HUE[HUE_PLACE];
     case CAT_GENERAL: case CAT_BACKUPS: case CAT_APPPERMS: case CAT_DEVICE:
@@ -43949,6 +44835,7 @@ static uint32_t settingsCatHue(int c) {
 
 // Which categories this board has at all (the rest are never built).
 static bool settingsCatOnBoard(int c) {
+  if (c == CAT_MQTT) return false;
 #if !CAP_BATTERY
   if (c == CAT_BATTERY) return false;
 #endif
@@ -43977,9 +44864,13 @@ static void settingsCatValue(int c, char* out, size_t cap) {
       if (NodePrefs* np = the_mesh.getNodePrefs()) snprintf(out, cap, "%s", np->node_name);
       break;
     case CAT_RADIO:
+#if defined(WADA_MESHTASTIC)
+      if(wadaBackend)snprintf(out,cap,"%s / %s",wada::regionName(wadaBackend->loraConfig().region),wada::presetName(wadaBackend->loraConfig().modem_preset));
+#else
       if (NodePrefs* np = the_mesh.getNodePrefs()) snprintf(out, cap, "%.3f MHz", (double)np->freq);
+#endif
       break;
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
     case CAT_WIFI:
       if (!wifiConfigWantsWifi())               snprintf(out, cap, "%s", TR("Off"));
       else if (WiFi.status() == WL_CONNECTED)   snprintf(out, cap, "%s", WiFi.SSID().c_str());
@@ -44604,6 +45495,38 @@ static void msgMenuCopyCb(lv_event_t* e) {
   closeMsgActionMenu();
 }
 
+#if defined(WADA_MESHTASTIC)
+static_assert(UITask::DELIV_NONE == 0 && UITask::DELIV_SENT == 1 && UITask::DELIV_DELIVERED == 2 &&
+              UITask::DELIV_FAILED == 3 && UITask::DELIV_PENDING == 4 && UITask::DELIV_MESH == 5 &&
+              UITask::DELIV_RELAYED == 6 && UITask::DELIV_UNCONFIRMED == 7, "Persisted delivery mapping changed");
+static WadaDelivery::State nativeDeliveryState(const UITask::UIMessage& m) {
+  return WadaDeliveryUI::state(m.deliv_state);
+}
+static bool nativeMessageRetryable(const UITask::UIMessage& m) {
+  const bool active_channel = !m.channel || (g_lv.task && g_lv.task->channelThreadAvailable(g_lv.task->activeThreadIdx()));
+  return active_channel && m.outgoing && WadaDelivery::retryable(nativeDeliveryState(m), m.delivery_error);
+}
+static const char* nativeDeliveryIcon(uint8_t state) {
+  switch (state) {
+    case UITask::DELIV_PENDING: case UITask::DELIV_SENT: return LV_SYMBOL_REFRESH;
+    case UITask::DELIV_MESH: return LV_SYMBOL_OK;
+    case UITask::DELIV_DELIVERED: return LV_SYMBOL_OK LV_SYMBOL_OK;
+    case UITask::DELIV_RELAYED: case UITask::DELIV_FAILED: return LV_SYMBOL_CLOSE;
+    default: return LV_SYMBOL_UPLOAD;
+  }
+}
+static uint32_t nativeDeliveryColor(uint8_t state) {
+  if (state == UITask::DELIV_MESH || state == UITask::DELIV_DELIVERED) return COLOR_STATUS_OK_TEXT;
+  if (state == UITask::DELIV_FAILED || state == UITask::DELIV_RELAYED ||
+      state == UITask::DELIV_PENDING || state == UITask::DELIV_SENT) return COLOR_STATUS_WARN_TEXT;
+  return COLOR_SUB;
+}
+static void nativeDeliveryText(const UITask::UIMessage& m, char* out, size_t size) {
+  snprintf(out, size, "%s %s", nativeDeliveryIcon(m.deliv_state),
+           TR(WadaDelivery::label(nativeDeliveryState(m), m.delivery_error)));
+}
+#endif
+
 // Forward decl so the menu's Info button can fire the popup.
 static void openMessageInfoPopup(int msg_idx);
 
@@ -44639,6 +45562,9 @@ static void composerFocusAfterMenu(LvChatPanel& p) {
 // also accepts a bare "@name" for backward-compat).
 static void msgMenuMentionCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+#if defined(WADA_MESHTASTIC)
+  if (!g_lv.task || (g_lv.task->activeThreadIsChannel() && !g_lv.task->channelThreadAvailable(g_lv.task->activeThreadIdx()))) return;
+#endif
   lv_indev_t* a = lv_indev_get_act();
   if (a) lv_indev_wait_release(a);
   closeMsgActionMenu();
@@ -44681,6 +45607,10 @@ static void msgMenuResendCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
   lv_indev_t* a = lv_indev_get_act();
   if (a) lv_indev_wait_release(a);
+#if defined(WADA_MESHTASTIC)
+  UITask::UIMessage current;
+  if (!g_lv.task->getMessageByIndex(s_msg_menu_idx, current) || !nativeMessageRetryable(current)) return;
+#endif
   closeMsgActionMenu();
   if (!s_msg_menu_text[0]) return;
   if (!g_lv.task->composerSend(s_msg_menu_text)) {
@@ -44732,11 +45662,23 @@ static void bubbleRetryTapCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
   const int idx = (int)(intptr_t)lv_event_get_user_data(e);
   UITask::UIMessage m;
-  if (!g_lv.task->getMessageByIndex(idx, m) || !m.outgoing ||
-      m.deliv_state != UITask::DELIV_FAILED || !m.text[0]) return;
+  if (!g_lv.task->getMessageByIndex(idx, m) || !m.outgoing || !m.text[0]) return;
+#if defined(WADA_MESHTASTIC)
+  if (!nativeMessageRetryable(m)) { openMessageInfoPopup(idx); return; }
+#else
+  if (m.deliv_state != UITask::DELIV_FAILED) return;
+#endif
   strncpy(s_retry_text, m.text, sizeof(s_retry_text) - 1);
   s_retry_text[sizeof(s_retry_text) - 1] = '\0';
+#if defined(WADA_MESHTASTIC)
+  char explanation[360];
+  snprintf(explanation, sizeof explanation, "%s: %s\n%s\n%s",
+           m.channel ? TR("Channel") : TR("To"), m.thread,
+           TR(WadaDelivery::detail(nativeDeliveryState(m), m.delivery_error)), TR("Try again?"));
+  showConfirm(explanation, TR("Try again"), retryConfirmedApply);
+#else
   showConfirm(TR("Message didn't get through.\nResend it?"), TR("Resend"), retryConfirmedApply);
+#endif
 }
 
 // Compose a one-tap "ack" for an incoming message: @mentions the sender (on a
@@ -44746,6 +45688,12 @@ static void bubbleRetryTapCb(lv_event_t* e) {
 static void buildAckText(UITask::UIMessage& m, char* out, size_t cap) {
   if (!out || cap == 0) return;
   out[0] = '\0';
+#if defined(WADA_MESHTASTIC)
+  snprintf(out, cap, "Acknowledged%s%s", m.channel && m.sender[0] ? ", " : "", m.channel ? m.sender : "");
+  if ((m.meta_flags & UITask::MSG_META_HAS_RX) && strlen(out) < cap)
+    snprintf(out + strlen(out), cap - strlen(out), ": SNR %.1f dB, RSSI %d dBm", double(m.snr_q4) / 4.0, int(m.rssi));
+  return;
+#endif
   int n = 0;
   if (m.channel && m.sender[0])
     n += snprintf(out + n, cap - (size_t)n, "@[%s], ack", m.sender);
@@ -44779,6 +45727,9 @@ static void buildAckText(UITask::UIMessage& m, char* out, size_t cap) {
 // (channel or DM) at the cursor, for the operator to review and send.
 static void msgMenuAckCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+#if defined(WADA_MESHTASTIC)
+  if (!g_lv.task || (g_lv.task->activeThreadIsChannel() && !g_lv.task->channelThreadAvailable(g_lv.task->activeThreadIdx()))) return;
+#endif
   lv_indev_t* a = lv_indev_get_act();
   if (a) lv_indev_wait_release(a);
   closeMsgActionMenu();
@@ -44809,10 +45760,20 @@ static void openMessageActionMenu(int msg_idx) {
   buildAckText(m, s_msg_menu_ack, sizeof s_msg_menu_ack);
   s_msg_menu_has_coords = chatFirstCoord(s_msg_menu_text, &s_msg_menu_lat, &s_msg_menu_lon);
   // "Ack" (quick link-quality confirmation) + "Mention" are for incoming messages.
-  const bool can_ack     = !m.outgoing && m.sender[0];   // ack its sender (channel or DM)
+#if defined(WADA_MESHTASTIC)
+  const bool writable = !m.channel || (g_lv.task && g_lv.task->channelThreadAvailable(g_lv.task->activeThreadIdx()));
+  const bool can_ack = writable && !m.outgoing && m.sender[0];
+  const bool can_mention = false; // Native mentions need an origin node ID, not a display name.
+#else
+  const bool can_ack     = !m.outgoing && m.sender[0];
   const bool can_mention = m.channel && !m.outgoing && m.sender[0];
+#endif
   const bool can_block   = !m.outgoing;   // block the sender — never for our own messages
+#if defined(WADA_MESHTASTIC)
+  const bool can_resend = nativeMessageRetryable(m) && m.text[0];
+#else
   const bool can_resend  = m.outgoing && m.text[0];   // re-send one of OUR messages (DM or channel)
+#endif
   const bool can_web = messageMenuLinkCount(s_msg_menu_text, CHAT_LINK_URL) > 0;
   const bool can_channel = messageMenuLinkCount(s_msg_menu_text, CHAT_LINK_HASHTAG) > 0;
   const bool can_map = messageMenuLinkCount(s_msg_menu_text, CHAT_LINK_COORD) > 0;
@@ -44936,7 +45897,11 @@ static void openMessageActionMenu(int msg_idx) {
   if (can_channel) mk_link_btn("#", TR("Channel"), CHAT_LINK_HASHTAG);
   mk_btn(LV_SYMBOL_LIST, TR(LV_SYMBOL_LIST "  Info"), msgMenuInfoCb);
   if (can_block)  mk_btn(LV_SYMBOL_CLOSE, TR(LV_SYMBOL_CLOSE "  Block"), msgMenuBlockCb);
+#if defined(WADA_MESHTASTIC)
+  if (can_resend) mk_btn(LV_SYMBOL_REFRESH, TR(LV_SYMBOL_REFRESH "  Try again"), msgMenuResendCb);
+#else
   if (can_resend) mk_btn(LV_SYMBOL_REFRESH, TR(LV_SYMBOL_REFRESH "  Resend"), msgMenuResendCb);
+#endif
   mk_btn(LV_SYMBOL_TRASH, TR(LV_SYMBOL_TRASH "  Delete"), msgMenuDeleteCb);
 }
 
@@ -45084,6 +46049,10 @@ static void openMessageInfoPopup(int msg_idx) {
   const bool has_rx = (m.meta_flags & UITask::MSG_META_HAS_RX) != 0;
   if (has_rx) {
     const bool is_flood = (m.meta_flags & UITask::MSG_META_IS_FLOOD) != 0;
+#if defined(WADA_MESHTASTIC)
+    if (m.path_len != 0xff)
+      blen += snprintf(body + blen, sizeof(body) - blen, "\nHops   %u", unsigned(m.path_len & 0x3f));
+#else
     if (is_flood) {
       blen += snprintf(body + blen, sizeof(body) - blen,
                        "\nPath   flood, %u hops, %u-byte hash",
@@ -45092,6 +46061,7 @@ static void openMessageInfoPopup(int msg_idx) {
       blen += snprintf(body + blen, sizeof(body) - blen,
                        "\nPath   direct (routed)");
     }
+#endif
     blen += snprintf(body + blen, sizeof(body) - blen,
                      "\nSNR    %.2f dB", (double)m.snr_q4 / 4.0);
     blen += snprintf(body + blen, sizeof(body) - blen,
@@ -45176,17 +46146,27 @@ static void openMessageInfoPopup(int msg_idx) {
                      "\nSNR    \xe2\x80\x94"
                      "\nRSSI   \xe2\x80\x94");
   }
+#if defined(WADA_MESHTASTIC)
+  if (m.outgoing && m.deliv_state != UITask::DELIV_NONE) {
+    blen += snprintf(body + blen, sizeof(body) - blen, "\n%s: %s", m.channel ? TR("Channel") : TR("To"), m.thread);
+    blen += snprintf(body + blen, sizeof(body) - blen, "\nStatus: %s\n%s",
+                     TR(WadaDelivery::label(nativeDeliveryState(m), m.delivery_error)),
+                     TR(WadaDelivery::detail(nativeDeliveryState(m), m.delivery_error)));
+  }
+#else
   // Delivery state (outgoing DMs only)
   if (m.outgoing && !m.channel) {
     const char* ds = "—";
     switch (m.deliv_state) {
       case UITask::DELIV_NONE:      ds = "queued";    break;
+      case UITask::DELIV_PENDING:   ds = "pending"; break;
       case UITask::DELIV_SENT:      ds = "sent";      break;
       case UITask::DELIV_DELIVERED: ds = "delivered"; break;
       case UITask::DELIV_FAILED:    ds = "failed";    break;
     }
     blen += snprintf(body + blen, sizeof(body) - blen, "\nStatus %s", ds);
   }
+#endif
   // "Repeats heard": echoes of our sent flood re-broadcast by nearby repeaters,
   // counted live this session. Shown for any tracked outgoing flood.
   if (m.outgoing && m.sent_fp) {
@@ -45933,6 +46913,13 @@ static void chatBuildBubbleMeta(const UITask::UIMessage& m, bool channel_mode,
   if (out_fg) *out_fg = COLOR_SUB;
   if (!out || out_len == 0) return;
 
+#if defined(WADA_MESHTASTIC)
+  if (m.outgoing && m.deliv_state != UITask::DELIV_NONE) {
+    nativeDeliveryText(m, out, out_len);
+    if (out_fg) *out_fg = nativeDeliveryColor(m.deliv_state);
+    return;
+  }
+#endif
   char ts_buf[20];
   formatBubbleTs(m.ts, ts_buf, sizeof(ts_buf));
 
@@ -45940,6 +46927,7 @@ static void chatBuildBubbleMeta(const UITask::UIMessage& m, bool channel_mode,
   uint32_t deliv_fg = COLOR_SUB;
   if (m.outgoing && !channel_mode && m.deliv_state != UITask::DELIV_NONE) {
     switch (m.deliv_state) {
+      case UITask::DELIV_PENDING:   deliv_glyph = " " LV_SYMBOL_REFRESH; deliv_fg=COLOR_SUB; break;
       case UITask::DELIV_SENT:      deliv_glyph = " " LV_SYMBOL_OK; deliv_fg = COLOR_SUB; break;
       case UITask::DELIV_DELIVERED: deliv_glyph = " " LV_SYMBOL_OK LV_SYMBOL_OK; deliv_fg = COLOR_ACCENT; break;
       case UITask::DELIV_FAILED:    deliv_glyph = " " LV_SYMBOL_CLOSE " tap to resend";
@@ -46056,6 +47044,14 @@ static void chatBuildFoot(const UITask::UIMessage& m, bool channel_mode, ChatFoo
     }
     return;
   }
+#if defined(WADA_MESHTASTIC)
+  if (m.deliv_state != UITask::DELIV_NONE) {
+    nativeDeliveryText(m, f.text, sizeof f.text);
+    f.fg = nativeDeliveryColor(m.deliv_state);
+  } else snprintf(f.text, sizeof f.text, "%s", ts);
+  return;
+#endif
+#if !defined(WADA_MESHTASTIC)
   if (channel_mode) {
     const uint8_t reps = m.sent_fp ? the_mesh.uiRepeatsForFp(m.sent_fp) : 0;
     if (reps > 0) {
@@ -46068,10 +47064,14 @@ static void chatBuildFoot(const UITask::UIMessage& m, bool channel_mode, ChatFoo
     }
     return;
   }
+#endif
   switch (m.deliv_state) {
     case UITask::DELIV_DELIVERED:
       f.fg = COLOR_GLOW;
       snprintf(f.text, sizeof f.text, "%s%s%s", TR("Delivered"), sep, ts);
+      break;
+    case UITask::DELIV_PENDING:
+      snprintf(f.text, sizeof f.text, "%s%s%s", TR("Pending"), sep, ts);
       break;
     case UITask::DELIV_SENT:
       snprintf(f.text, sizeof f.text, "%s%s%s", TR("Sent"), sep, ts);
@@ -46131,6 +47131,17 @@ static void chatFootChainDrawCb(lv_event_t* e) {
   }
 }
 
+static lv_coord_t chatFootHeight(const ChatFoot& foot) {
+#if defined(WADA_MESHTASTIC)
+  const lv_coord_t max_w = LV_MAX((lv_coord_t)10, (lv_coord_t)(s_chat_virt.content_w - 2 * kChatSideGutter - chatFootChainW(foot)));
+  lv_point_t size;
+  lv_txt_get_size(&size, foot.text, &g_font_12, 0, 0, max_w, LV_TEXT_FLAG_NONE);
+  return LV_MAX(size.y, (lv_coord_t)lv_font_get_line_height(&g_font_12));
+#else
+  return lv_font_get_line_height(&g_font_12);
+#endif
+}
+
 static lv_coord_t chatMeasureBubbleHeight(const UITask::UIMessage& m, bool channel_mode,
                                           bool thread_is_room, lv_coord_t bubble_max_w) {
   ChatBubbleDisplay d{};
@@ -46147,7 +47158,9 @@ static lv_coord_t chatMeasureBubbleHeight(const UITask::UIMessage& m, bool chann
   lv_txt_get_size(&wrapped_size, d.san_text, msg_font, 0, 0,
                   txt_w_used > 0 ? txt_w_used : LV_COORD_MAX, LV_TEXT_FLAG_NONE);
 
-  return kChatBubblePadV * 2 + inner_y + wrapped_size.y + kChatFootGap + lv_font_get_line_height(&g_font_12);
+  ChatFoot foot;
+  chatBuildFoot(m, channel_mode, foot);
+  return kChatBubblePadV * 2 + inner_y + wrapped_size.y + kChatFootGap + chatFootHeight(foot);
 }
 
 static void chatBuildCompactLine(const UITask::UIMessage& m, LvChatPanel* p, int logical_i,
@@ -46182,15 +47195,26 @@ static void chatBuildCompactLine(const UITask::UIMessage& m, LvChatPanel* p, int
   char ts_c[12];
   formatBubbleHhMm(m.ts, ts_c, sizeof(ts_c));
   const char* dglyph = "";
+#if defined(WADA_MESHTASTIC)
+  char native_status[96] = "";
+  if (m.outgoing && m.deliv_state != UITask::DELIV_NONE) nativeDeliveryText(m, native_status, sizeof native_status);
+  dglyph = native_status;
+#endif
   uint32_t dfg = COLOR_SUB;
+#if defined(WADA_MESHTASTIC)
+  dfg = nativeDeliveryColor(m.deliv_state);
+#endif
   if (m.outgoing && !p->channel_mode && m.deliv_state != UITask::DELIV_NONE) {
+#if !defined(WADA_MESHTASTIC)
     switch (m.deliv_state) {
+      case UITask::DELIV_PENDING: dglyph=LV_SYMBOL_REFRESH; dfg=COLOR_SUB; break;
       case UITask::DELIV_SENT:      dglyph = LV_SYMBOL_UPLOAD;          dfg = COLOR_SUB;    break;
       case UITask::DELIV_DELIVERED: dglyph = LV_SYMBOL_OK LV_SYMBOL_OK; dfg = COLOR_ACCENT; break;
       case UITask::DELIV_FAILED:    dglyph = LV_SYMBOL_CLOSE " tap to resend";
                                      dfg = (s_theme_day || s_theme_high_contrast)
                                          ? COLOR_STATUS_DANGER_TEXT : 0xE08080; break;
     }
+#endif
   }
   char reps[12] = "";
   if (m.outgoing && m.sent_fp) {
@@ -46229,13 +47253,21 @@ static void chatBuildCompactPlainLine(const UITask::UIMessage& m, LvChatPanel* p
   char ts_c[12];
   formatBubbleHhMm(m.ts, ts_c, sizeof(ts_c));
   const char* dglyph = "";
+#if defined(WADA_MESHTASTIC)
+  char native_status[96] = "";
+  if (m.outgoing && m.deliv_state != UITask::DELIV_NONE) nativeDeliveryText(m, native_status, sizeof native_status);
+  dglyph = native_status;
+#endif
   if (m.outgoing && !p->channel_mode && m.deliv_state != UITask::DELIV_NONE) {
+#if !defined(WADA_MESHTASTIC)
     switch (m.deliv_state) {
+      case UITask::DELIV_PENDING: dglyph=LV_SYMBOL_REFRESH; break;
       case UITask::DELIV_SENT:      dglyph = LV_SYMBOL_UPLOAD; break;
       case UITask::DELIV_DELIVERED: dglyph = LV_SYMBOL_OK LV_SYMBOL_OK; break;
       case UITask::DELIV_FAILED:    dglyph = LV_SYMBOL_CLOSE " tap to resend"; break;
       default: break;
     }
+#endif
   }
   char reps[12] = "";
   if (m.outgoing && m.sent_fp) {
@@ -46282,7 +47314,7 @@ static lv_coord_t chatCompactEmojiLift(const char* line) {
 static lv_coord_t chatMeasureCompactRowHeight(const UITask::UIMessage& m, LvChatPanel* p,
                                               int logical_i, const ChatBubbleDisplay& d) {
   (void)logical_i;
-  char line[640];
+  char line[896];
   chatBuildCompactPlainLine(m, p, d, line, sizeof(line));
   static constexpr lv_coord_t kPadH = 3;
   const lv_coord_t inner_w = (s_chat_virt.content_w > kPadH * 2)
@@ -46720,6 +47752,10 @@ static bool chatFirstUrl(const char* s, char* out, int cap) {
 // Find a channel-sized #word (including hyphens) outside @[...] mentions and URL fragments.
 // Return its half-open byte span, including the leading '#'.
 static bool chatHashtagSpan(const char* text, int from, int* start, int* end) {
+#if defined(WADA_MESHTASTIC)
+  (void)text; (void)from; (void)start; (void)end;
+  return false;
+#endif
   return ChatHashtag::span(text, from, start, end);
 }
 // ---- QR popup: a scannable QR of a URL ----
@@ -46731,6 +47767,11 @@ static void urlQrBackdropCb(lv_event_t* e) {
   closeUrlQr();
 }
 static void openUrlQrPopup(const char* url) {
+  char full[1100];
+  if (!qrPopupUrl(url, full, sizeof full)) {
+    if (g_lv.task) g_lv.task->showAlert(TR("This URL is too large to share"), 2000);
+    return;
+  }
   closeUrlQr();
   lv_coord_t sw = lv_disp_get_hor_res(nullptr), sh = lv_disp_get_ver_res(nullptr);
   s_urlqr_root = lv_obj_create(lv_layer_top());
@@ -46743,8 +47784,8 @@ static void openUrlQrPopup(const char* url) {
   lv_obj_add_event_cb(s_urlqr_root, urlQrBackdropCb, LV_EVENT_CLICKED, nullptr);
   int card_w = PCW(230); if (card_w > modalAvailW()) card_w = modalAvailW();
   int card_h = PSC(250); if (card_h > modalAvailH()) card_h = modalAvailH();
-  int qr_size = card_h - 34 - 34 - 20; if (qr_size > PSC(160)) qr_size = PSC(160);
-  if (qr_size > card_w - 20) qr_size = card_w - 20; if (qr_size < 96) qr_size = 96;
+  const auto layout = QrPopupLayout::make(card_w, card_h, lv_font_get_line_height(&g_font_12), PSC(160));
+  const int qr_size = layout.size;
   lv_obj_t* card = lv_obj_create(s_urlqr_root);
   lv_obj_remove_style_all(card);
   lv_obj_set_size(card, card_w, card_h);
@@ -46764,12 +47805,13 @@ static void openUrlQrPopup(const char* url) {
   lv_obj_set_style_text_color(title, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
   lv_obj_set_style_text_font(title, &g_font_14, LV_PART_MAIN);
   lv_obj_set_pos(title, 0, 4);
-  char full[260];   // a bare www. host gets https:// so the phone opens it
-  if (!urlCiHas(url, "http", 4)) snprintf(full, sizeof full, "https://%s", url);
-  else                          snprintf(full, sizeof full, "%s", url);
   lv_obj_t* qr = lv_qrcode_create(card, qr_size, lv_color_hex(0x000000), lv_color_hex(0xFFFFFF));
-  lv_qrcode_update(qr, full, strlen(full));
-  lv_obj_align(qr, LV_ALIGN_TOP_MID, 0, 32);
+  if (lv_qrcode_update(qr, full, strlen(full)) != LV_RES_OK) {
+    closeUrlQr();
+    if (g_lv.task) g_lv.task->showAlert(TR("Could not encode this QR code"), 2000);
+    return;
+  }
+  lv_obj_align(qr, LV_ALIGN_TOP_MID, 0, layout.top);
   lv_obj_set_style_border_color(qr, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
   lv_obj_set_style_border_width(qr, 4, LV_PART_MAIN);
   lv_obj_t* u = lv_label_create(card);
@@ -46778,7 +47820,8 @@ static void openUrlQrPopup(const char* url) {
   lv_label_set_text(u, url);
   lv_obj_set_style_text_font(u, &g_font_12, LV_PART_MAIN);
   lv_obj_set_style_text_color(u, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
-  lv_obj_align(u, LV_ALIGN_BOTTOM_MID, 0, -2);
+  lv_obj_set_size(u, layout.width, layout.captionHeight);
+  lv_obj_set_pos(u, 0, layout.captionTop);
 }
 
 // ---- URL action menu (short tap on a chat URL) ----
@@ -46795,7 +47838,7 @@ static void urlMenuQrCb(lv_event_t* e) {
   char u[240]; snprintf(u, sizeof u, "%s", s_urlmenu_url);
   closeUrlMenu(); openUrlQrPopup(u);
 }
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION) && CAP_WEB_BROWSER
+#if defined(ESP32) && defined(WADA_NETWORK_UI) && CAP_WEB_BROWSER
 static void urlMenuOpenWebCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   char u[240]; snprintf(u, sizeof u, "%s", s_urlmenu_url);
@@ -46829,7 +47872,7 @@ static void openUrlMenu(const char* url) {
   lv_obj_clear_flag(s_urlmenu_root, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_urlmenu_root, urlMenuBackdropCb, LV_EVENT_CLICKED, nullptr);
   const int card_w = PCW(230), btn_h = PSC(34), pad = PSC(12), gap = PSC(8), url_h = PSC(18);
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
   const int nbtn = 2;
 #else
   const int nbtn = 1;
@@ -46866,7 +47909,7 @@ static void openUrlMenu(const char* url) {
     lv_obj_center(l);
     by += btn_h + gap;
   };
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION) && CAP_WEB_BROWSER
+#if defined(ESP32) && defined(WADA_NETWORK_UI) && CAP_WEB_BROWSER
   mk(TR(LV_SYMBOL_WIFI "  Open in web"), urlMenuOpenWebCb);
 #endif
   mk(TR(LV_SYMBOL_IMAGE "  Create QR"), urlMenuQrCb);
@@ -47317,7 +48360,7 @@ static lv_coord_t chatVirtCreateBubble(LvChatPanel* p, int logical_i, int ring_i
 
   ChatFoot foot;
   chatBuildFoot(m, p->channel_mode, foot);
-  const lv_coord_t foot_lh = lv_font_get_line_height(&g_font_12);
+  const lv_coord_t foot_lh = chatFootHeight(foot);
   const lv_coord_t chain_w = chatFootChainW(foot);
   const lv_coord_t foot_txt_w = lv_txt_get_width(foot.text, strlen(foot.text), &g_font_12, 0, LV_TEXT_FLAG_NONE);
   const lv_coord_t foot_w = LV_MIN((lv_coord_t)(chain_w + foot_txt_w), (lv_coord_t)(kContentW - 2 * kChatSideGutter));
@@ -47395,7 +48438,11 @@ static lv_coord_t chatVirtCreateBubble(LvChatPanel* p, int logical_i, int ring_i
   if (txt_size.x > kInnerMaxW) lv_label_set_long_mode(tlbl, LV_LABEL_LONG_WRAP);
   lv_obj_set_width(tlbl, txt_w_used);
   lv_obj_set_pos(tlbl, 0, inner_y);
+#if defined(WADA_MESHTASTIC)
+  const bool failed_send = nativeMessageRetryable(m);
+#else
   const bool failed_send = m.outgoing && m.deliv_state == UITask::DELIV_FAILED;
+#endif
   lv_obj_t* link_label = nullptr;
 #if !defined(HAS_TDECK_PRO)
   if ((has_url || has_coords || has_hashtag) && !failed_send) {
@@ -47420,7 +48467,16 @@ static lv_coord_t chatVirtCreateBubble(LvChatPanel* p, int logical_i, int ring_i
     }
     lv_obj_t* fl = lv_label_create(row);
     lv_label_set_text(fl, foot.text);
+#if defined(WADA_MESHTASTIC)
+    lv_label_set_long_mode(fl, LV_LABEL_LONG_WRAP);
+    if (m.outgoing && m.deliv_state != UITask::DELIV_NONE) {
+      lv_obj_add_flag(fl, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_add_event_cb(fl, bubbleRetryTapCb, LV_EVENT_CLICKED,
+                          reinterpret_cast<void*>(static_cast<intptr_t>(ring_idx)));
+    }
+#else
     lv_label_set_long_mode(fl, LV_LABEL_LONG_DOT);
+#endif
     lv_obj_set_style_text_font(fl, &g_font_12, LV_PART_MAIN);
     lv_obj_set_style_text_color(fl,
 #if defined(HAS_TDECK_PRO)
@@ -47481,7 +48537,7 @@ static lv_coord_t chatVirtCreateCompactRow(LvChatPanel* p, int logical_i, int ri
   chatParseMessageDisplay(m, p->channel_mode, s_chat_virt.thread_is_room, d);
   const bool mentions_me = (p->channel_mode || s_chat_virt.thread_is_room) &&
                            !m.outgoing && textMentionsMe(d.show_text);
-  char line[640];
+  char line[896];
 #if defined(HAS_TDECK_PRO)
   const bool epaper_channel = p->channel_mode;
   if (epaper_channel) chatBuildCompactPlainLine(m, p, d, line, sizeof(line));
@@ -47538,10 +48594,10 @@ static lv_coord_t chatVirtCreateCompactRow(LvChatPanel* p, int logical_i, int ri
                       reinterpret_cast<void*>(static_cast<intptr_t>(ring_idx)));
   double compact_lat = 0.0, compact_lon = 0.0;
   const bool compact_has_coords = chatFirstCoord(m.text, &compact_lat, &compact_lon);
-  if (compact_has_coords && !(m.outgoing && m.deliv_state == UITask::DELIV_FAILED))
+  if (compact_has_coords && !(m.outgoing && m.deliv_state != UITask::DELIV_NONE))
     lv_obj_add_event_cb(row, bubbleCoordTapCb, LV_EVENT_SHORT_CLICKED,
                         reinterpret_cast<void*>(static_cast<intptr_t>(ring_idx)));
-  if (m.outgoing && m.deliv_state == UITask::DELIV_FAILED)
+  if (m.outgoing && m.deliv_state != UITask::DELIV_NONE)
     lv_obj_add_event_cb(row, bubbleRetryTapCb, LV_EVENT_CLICKED,
                         reinterpret_cast<void*>(static_cast<intptr_t>(ring_idx)));
   lv_obj_set_pos(row, 0, vp_y);
@@ -47845,6 +48901,9 @@ static void chatVirtApplyPendingScroll(LvChatPanel* p) {
   chatVirtRefreshScrollArea(p);
   if (to_bottom) chatVirtSyncScrollState(p, y, chatVirtMaxVirtTop(p));
   else           chatVirtSyncScrollState(p, y);
+#if defined(WADA_MESHTASTIC)
+  if (to_bottom) p->follow_own_send = false;
+#endif
   s_chat_virt.last_i0 = -1;
   s_chat_virt.last_i1 = -1;
 }
@@ -47943,6 +49002,22 @@ static void refreshChatDetail(LvChatPanel& p) {
     chatVirtResetToPlaceholder(p, "No thread selected.\n\nTap a chat to open it.");
     return;
   }
+#if defined(WADA_MESHTASTIC)
+  const bool read_only = p.channel_mode && !g_lv.task->channelThreadAvailable(g_lv.task->activeThreadIdx());
+  if (p.composer_row) {
+    if (read_only) { hideKb(); lv_obj_add_flag(p.composer_row, LV_OBJ_FLAG_HIDDEN); }
+    else lv_obj_clear_flag(p.composer_row, LV_OBJ_FLAG_HIDDEN);
+  }
+  if (!p.channel_mode && p.send_btn) {
+    ContactInfo contact{};
+    const bool found = g_lv.task->lookupActiveContact(contact);
+    const uint32_t number = found ? WadaMeshtasticBackend::keyNode(contact.id.pub_key) : 0;
+    const bool allowed = wadaBackend && wadaBackend->canMessage(number);
+    if (allowed) lv_obj_clear_state(p.send_btn, LV_STATE_DISABLED);
+    else lv_obj_add_state(p.send_btn, LV_STATE_DISABLED);
+    if (p.composer_ta) taSetPlaceholder(p.composer_ta, allowed ? TR("Type a message...") : TR("Open chat settings to exchange user info"));
+  }
+#endif
   // Only what the user can actually see counts as read. A chat left open under
   // a dark or locked screen used to clear every new message on arrival, so the
   // lock screen's unread cards stayed empty. wakeScreen / lockscreenHide re-run
@@ -48058,6 +49133,9 @@ static void refreshChatDetail(LvChatPanel& p) {
 #if CAP_KEYPAD_NAV
   if (!s_chat_just_opened)
     scroll_target = chatRefreshKeepCursorVisible(p, scroll_target, chatKeypadFocusIndex(&p));
+#endif
+#if defined(WADA_MESHTASTIC)
+  if (p.follow_own_send) scroll_target = LV_COORD_MAX;
 #endif
 
   chatVirtResetInputForMsgs(&p);
@@ -48409,11 +49487,19 @@ static void refreshChatList(LvChatPanel& p) {
       const lv_coord_t prev_right = kPadR + (pill_w ? pill_w + 8 : 0) + 6;
       if (have && pout) {
         // Your own last message: delivery ticks for a direct chat, then a quiet "You:".
-        if (!ch && (pdeliv == UITask::DELIV_SENT || pdeliv == UITask::DELIV_DELIVERED)) {
+        if (pdeliv != UITask::DELIV_NONE) {
           lv_obj_t* tk = lv_label_create(btn);
+#if defined(WADA_MESHTASTIC)
+          lv_label_set_text(tk, nativeDeliveryIcon(pdeliv));
+#else
           lv_label_set_text(tk, pdeliv == UITask::DELIV_DELIVERED ? UI_ICON_CHECK_CHECK : UI_ICON_CHECK);
+#endif
           lv_obj_set_style_text_font(tk, &g_font_16, LV_PART_MAIN);
+#if defined(WADA_MESHTASTIC)
+          lv_obj_set_style_text_color(tk, lv_color_hex(nativeDeliveryColor(pdeliv)), LV_PART_MAIN);
+#else
           lv_obj_set_style_text_color(tk, lv_color_hex(pdeliv == UITask::DELIV_DELIVERED ? COLOR_GLOW : COLOR_TERTIARY), LV_PART_MAIN);
+#endif
           lv_obj_align(tk, LV_ALIGN_BOTTOM_LEFT, px, -(kPrevB - 1));
           px += SC(20);
         }
@@ -48707,6 +49793,13 @@ static void refreshContactsList() {
     else                          lv_obj_add_flag(g_lv.contacts_search_indicator, LV_OBJ_FLAG_HIDDEN);
   }
 
+#if defined(WADA_MESHTASTIC)
+  const unsigned nativeUnheard = wadaCollectUnheard(nullptr, 0, false);
+  const unsigned nativeRemovable = wadaCollectUnheard(nullptr, 0, true);
+  const bool aggregateUnheard = nativeUnheard > 2 && nativeUnheard * 2 > unsigned(curr_count);
+  if (aggregateUnheard || s_native_clear_waiting) wadaUnheardBanner(g_lv.contacts_list, nativeUnheard, nativeRemovable);
+#endif
+
   // Snapshot matching contacts so we can sort them. File-static array on
   // .bss — no heap allocation per refresh.
   struct Entry {
@@ -48775,7 +49868,11 @@ static void refreshContactsList() {
     if (!the_mesh.getContactByIdx(static_cast<uint32_t>(i), c) || !c.name[0]) continue;
     const bool is_rep = (c.type == ADV_TYPE_REPEATER);
 #if defined(ESP32)
+#if defined(WADA_MESHTASTIC)
+    const bool is_fav = wadaContactIsFavorite(c);
+#else
     const bool is_fav = touchPrefsFavoritesSnapshotContains(fav_buf, fav_count, c.id.pub_key);
+#endif
     bool is_blocked = false;
     for (int b = 0; b < ign_count; ++b)
       if (memcmp(&ign_buf[b * TOUCH_IGNORE_KEY_BYTES], c.id.pub_key, TOUCH_IGNORE_KEY_BYTES) == 0) { is_blocked = true; break; }
@@ -48799,6 +49896,12 @@ static void refreshContactsList() {
     e.is_fav     = is_fav;
     e.is_blocked = is_blocked;
     e.out_path_len = c.out_path_len;
+#if defined(WADA_MESHTASTIC)
+    if (const auto *node = wadaNodeForContact(c)) {
+      e.out_path_len = node->has_hops_away ? node->hops_away : OUT_PATH_UNKNOWN;
+      e.is_blocked = e.is_blocked || node->is_ignored;
+    }
+#endif
     e.last_heard = c.last_advert_timestamp;
     memcpy(e.key6, c.id.pub_key, 6);
     strncpy(e.name, contactShownName(c.id.pub_key, c.name), sizeof(e.name) - 1);   // nickname first; sorts by it too
@@ -48883,7 +49986,11 @@ static void refreshContactsList() {
   const lv_coord_t kAv    = SC(28);
   const lv_coord_t kPadR  = 6;
   const lv_coord_t av_x   = sel_md ? 32 : 6;
+#if defined(WADA_MESHTASTIC)
+  const lv_coord_t text_x = av_x + kAv + 36;
+#else
   const lv_coord_t text_x = av_x + kAv + 10;
+#endif
   const lv_coord_t kNameY = SC(2);
   const lv_coord_t kSubB  = SC(2);
   const lv_coord_t name_base = kNameY + lv_font_get_line_height(&g_font_semi_14) - g_font_semi_14.base_line;
@@ -48908,9 +50015,16 @@ static void refreshContactsList() {
       snprintf(loc_buf, sizeof(loc_buf), "%s", dist[0] ? dist : "GPS");
     }
 
+    int statusHeight = 0;
+#if defined(WADA_MESHTASTIC)
+    ContactInfo statusContact{};
+    const char* status = wadaBackend && the_mesh.getContactByIdx(e.mesh_idx, statusContact)
+      ? wadaBackend->nodeStatus(WadaMeshtasticBackend::keyNode(statusContact.id.pub_key)) : "";
+    statusHeight = wadaStatusCardHeight(status, row_w - text_x - kPadR);
+#endif
     lv_obj_t* rb = lv_obj_create(g_lv.contacts_list);
     lv_obj_remove_style_all(rb);
-    lv_obj_set_size(rb, row_w, ROW_H);
+    lv_obj_set_size(rb, row_w, ROW_H + (statusHeight ? statusHeight + 4 : 0));
     lv_obj_set_style_radius(rb, SC(10), LV_PART_MAIN);
     lv_obj_set_style_bg_color(rb, lv_color_hex(COLOR_CONTROL), LV_PART_MAIN | LV_STATE_PRESSED);
     lv_obj_set_style_bg_opa(rb, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_PRESSED);
@@ -48950,7 +50064,7 @@ static void refreshContactsList() {
     }
 
     lv_obj_t* av = makeGlyphAvatar(rb, e.name, e.type == ADV_TYPE_CHAT ? GLYPH_CIRCLE : GLYPH_SQUARE, kAv);
-    lv_obj_align(av, LV_ALIGN_LEFT_MID, av_x, 0);
+    lv_obj_align(av, LV_ALIGN_TOP_LEFT, av_x, (ROW_H - kAv) / 2);
     {
       // Same icon as the contact's chat (#646): the one picked for the chat, which is
       // keyed on the advertised name, else the first emoji in the shown name (#640).
@@ -48960,6 +50074,27 @@ static void refreshContactsList() {
                           touchPrefsGetChannelEmoji(ci.name, eb, sizeof eb);
       if (picked || nameFirstEmoji(e.name, eb, sizeof eb)) glyphAvatarSetEmoji(av, e.name, eb);
     }
+
+#if defined(WADA_MESHTASTIC)
+    ContactInfo nativeContact{};
+    if (the_mesh.getContactByIdx(e.mesh_idx, nativeContact)) {
+      const uint32_t number = WadaMeshtasticBackend::keyNode(nativeContact.id.pub_key);
+      auto* security = wadaSecurityGlyph(rb, wadaBackend->nodeSecurity(number));
+      lv_obj_set_pos(security, av_x + kAv + 4, kNameY);
+      if (!aggregateUnheard && wadaBackend->unheardOnCurrentLora(number)) {
+        auto* unheard = lv_label_create(rb);
+        setIconLabel(unheard, UI_ICON_RADIO_TOWER);
+        lv_obj_set_style_text_color(unheard, lv_color_hex(COLOR_STATUS_WARN_TEXT), LV_PART_MAIN);
+        lv_obj_set_pos(unheard, av_x + kAv - 12, ROW_H - 16);
+        static const lv_point_t unheardSlash[] = {{0, 15}, {15, 0}};
+        auto* slash = lv_line_create(unheard);
+        lv_line_set_points(slash, unheardSlash, 2);
+        lv_obj_set_style_line_color(slash, lv_color_hex(COLOR_STATUS_WARN_TEXT), LV_PART_MAIN);
+        lv_obj_set_style_line_width(slash, 2, LV_PART_MAIN);
+        navSetTip(unheard, TR("Not heard on your current LoRa settings"));
+      }
+    }
+#endif
 
     // Name, one line; a star after it for a favourite.
     char san[40];
@@ -48987,11 +50122,17 @@ static void refreshContactsList() {
 
     // What it is, and how we reach it: "Repeater · 2 hops", "Room · direct".
     {
+#if defined(WADA_MESHTASTIC)
+      ContactInfo contact{};
+      const auto *node = the_mesh.getContactByIdx(e.mesh_idx, contact) ? wadaNodeForContact(contact) : nullptr;
+      const char* kind = e.is_blocked ? TR("Ignored") : node && node->has_user ? wadaRoleLabel(node->user.role) : TR("Node");
+#else
       const char* kind = e.is_blocked ? TR("Blocked")
                        : is_rep ? TR("Repeater")
                        : e.type == ADV_TYPE_ROOM ? TR("Room")
                        : e.type == ADV_TYPE_SENSOR ? TR("Sensor")
                        : TR("Companion");
+#endif
       char sub[48];
       if (e.out_path_len != OUT_PATH_UNKNOWN && !e.is_blocked) {
         const unsigned hops = e.out_path_len & 0x3F;
@@ -49006,7 +50147,7 @@ static void refreshContactsList() {
       lv_obj_set_style_text_font(sl, &g_font_12, LV_PART_MAIN);
       lv_obj_set_style_text_color(sl, lv_color_hex(e.is_blocked ? COLOR_STATUS_DANGER_TEXT : COLOR_TERTIARY), LV_PART_MAIN);
       lv_obj_set_size(sl, name_room, lv_font_get_line_height(&g_font_12));
-      lv_obj_align(sl, LV_ALIGN_BOTTOM_LEFT, text_x, -kSubB);
+      lv_obj_align(sl, LV_ALIGN_TOP_LEFT, text_x, ROW_H - kSubB - lv_font_get_line_height(&g_font_12));
     }
 
     // Last heard, on the name's line at the right (updated in place each minute, #82).
@@ -49030,9 +50171,13 @@ static void refreshContactsList() {
       lv_obj_set_style_text_align(ll, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
       lv_obj_set_width(ll, right_w);
       lv_label_set_long_mode(ll, LV_LABEL_LONG_CLIP);
-      lv_obj_align(ll, LV_ALIGN_BOTTOM_RIGHT, -kPadR, -kSubB);
+      lv_obj_align(ll, LV_ALIGN_TOP_RIGHT, -kPadR, ROW_H - kSubB - lv_font_get_line_height(&g_font_12));
     }
 
+#if defined(WADA_MESHTASTIC)
+    if (auto* statusRow = wadaStatusRow(rb, status, row_w - text_x - kPadR, false))
+      lv_obj_set_pos(statusRow, text_x, ROW_H + 2);
+#endif
   }
 
   // Overflow notice: more contacts matched than the 128-row render budget — surface
@@ -49231,7 +50376,7 @@ static void updateTrackball(unsigned long now) {
 
   // ---- Snake game ----
   // While Snake is open the trackball steers it (no soft cursor on that page).
-  if (SnakeGame::isOpen() || luaAppIsOpen()) {
+  if (WadaSnakeGame::isOpen() || luaAppIsOpen()) {
     if (!lv_obj_has_flag(s_tb_cursor, LV_OBJ_FLAG_HIDDEN))
       lv_obj_add_flag(s_tb_cursor, LV_OBJ_FLAG_HIDDEN);
     // The centre button was simply dropped here, so a Lua app could be steered
@@ -49251,7 +50396,7 @@ static void updateTrackball(unsigned long now) {
     s_tb_click_prev_app = click_now;
     if (moved && (dx != 0 || dy != 0)) {
       if (luaAppIsOpen()) luaAppSteer(dx, dy);
-      else                SnakeGame::steer(dx, dy);
+      else                WadaSnakeGame::steer(dx, dy);
       if (g_lv.task) g_lv.task->noteUserInput();
     }
     return;
@@ -53163,6 +54308,11 @@ static void doBackupImportChosen() {
   }
 }
 static void confirmBackupImport(const char* stored) {
+#if defined(WADA_MESHTASTIC)
+  (void)stored;
+  if (g_lv.task) g_lv.task->showAlert(TR("Use a Meshtastic client to restore node configuration"), 2500);
+  return;
+#endif
   if (!stored) return;
   strncpy(s_backup_chosen, stored, sizeof(s_backup_chosen) - 1);
   s_backup_chosen[sizeof(s_backup_chosen) - 1] = '\0';
@@ -53346,6 +54496,11 @@ static void backupMakeFilename(char* out, size_t cap, bool probe_storage) {
 // "Exporting…" overlay and toasts the saved path. Shared by the Profile "Export
 // settings" button (fixed app-compatible name) and the Backups page (timestamped).
 static void doExportBackupFile(const char* fname) {
+#if defined(WADA_MESHTASTIC)
+  (void)fname;
+  if (g_lv.task) g_lv.task->showAlert(TR("Use a Meshtastic client to back up node configuration"), 2500);
+  return;
+#endif
   if (!g_lv.task) return;
   lv_obj_t* ov = lv_obj_create(lv_layer_top());
   lv_obj_remove_style_all(ov);
@@ -53488,10 +54643,27 @@ static void doFactoryReset() {
 }
 static void backupFactoryResetCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+#if defined(WADA_MESHTASTIC)
+  showConfirm("Erase WADAMESH files/chats? Meshtastic identity and settings stay. This cannot be undone.",TR("Reset UI"),doFactoryReset);
+#else
   showConfirm(TR("Factory reset?\n\nErases identity, contacts,\nchannels, messages, Wi-Fi\nand every setting. This\ncannot be undone."), TR("Erase all"), doFactoryReset);
+#endif
 }
 
 static void buildBackupsSettings() {
+#if defined(WADA_MESHTASTIC)
+  auto *card = setCard("Meshtastic configuration");
+  setNote(card, "Use a Meshtastic phone or desktop client to back up the node configuration. Channel QR codes share channel settings and keys.");
+  setActionRow(card, UI_ICON_HASH, "Channel settings", nullptr, [](lv_event_t *) { openSettingsCategory(CAT_CHANNELS); });
+  card = setCard("WADAMESH storage");
+  setButton(card, LV_SYMBOL_SAVE, "Save chat history now", [](lv_event_t *) {
+    if (g_lv.task) { g_lv.task->persistHistoryNow(); g_lv.task->showAlert(TR("Chat history save requested"), 1500); }
+  });
+  setNote(card, "Messages and display preferences use WADAMESH storage. Meshtastic identity and radio configuration use firmware storage.");
+  setButton(card, UI_ICON_TRASH_2, "Reset WADAMESH UI", backupFactoryResetCb, nullptr, SET_DANGER);
+  setNote(card, "Erases WADAMESH files and chat history. Meshtastic identity and configuration are preserved.");
+  return;
+#endif
   // One backup file. Timestamped, every export is a new snapshot; without, it reuses
   // the fixed name the MeshCore app reads and writes.
   {
@@ -53564,8 +54736,13 @@ static void buildBackupsSettings() {
 
   {
     lv_obj_t* c = setCard("Danger zone");
+#if defined(WADA_MESHTASTIC)
+    setButton(c,UI_ICON_TRASH_2,"Reset WADAMESH UI",backupFactoryResetCb,nullptr,SET_DANGER);
+    setNote(c,"Erases WADAMESH files and chat history. Meshtastic identity and configuration are preserved.");
+#else
     setButton(c, UI_ICON_TRASH_2, "Factory reset", backupFactoryResetCb, nullptr, SET_DANGER);
     setNote(c, "Erases identity, contacts, channels, messages, Wi-Fi and all settings, then reboots.");
+#endif
   }
 }
 
@@ -54269,7 +55446,7 @@ static bool m9HandleArrowKey(int key, lv_obj_t* ta) {
         case M9_KEY_RIGHT: mapNudge(3); break;
         default: return false;
       }
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
       // Panned into an area with no cached tiles while offline: the fetch
       // queue silently no-ops without Wi-Fi, so the leading edge stays blank
       // with only the small corner label saying why. Say it once per session.
@@ -55088,6 +56265,14 @@ if (g_lv.task && g_lv.task->isManualLock()) {
       if (g_lv.task && p->composer_ta) {
         const char* text = lv_textarea_get_text(p->composer_ta);
         if (text && text[0]) {
+#if defined(WADA_MESHTASTIC)
+          char normalized[UITask::MAX_MSG_TEXT + 1];
+          if (!wadaNormalizeMessage(text, normalized, sizeof(normalized), false)) {
+            g_lv.task->showAlert(TR("Message is too long or invalid UTF-8; nothing was sent"), 3000);
+            return;
+          }
+          text = normalized;
+#endif
           g_lv.task->setComposerMode(true);
           g_lv.task->composerReset();
           for (const char* cp = text; *cp; ++cp) g_lv.task->composerAppendChar(*cp);
@@ -55486,6 +56671,9 @@ static void bleKbdDispatch(int key) {
 
   if (key & BLE_KEY_TEXT) {
     lv_obj_t* ta = bleKbdTouchTypingTarget();
+#if defined(WADA_DESKTOP)
+    if (!ta) ta = bleKbdTouchTappedField();
+#endif
     if (!ta && bleKbdTabHotkey(key & ~BLE_KEY_TEXT)) return;
     if (!ta) ta = bleKbdTouchTappedField();
     if (!ta) return;
@@ -56116,7 +57304,7 @@ static void showSubtleNotifyLvgl(const char* text, uint32_t duration_ms) {
   lv_timer_set_repeat_count(s_notify_chip_timer, 1);
 }
 
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
 static const char* wifiStaStatusBrief(int s) {
 #if defined(HAS_TDISPLAY_P4) && !TDP4_C6_HOSTED
   // Legacy ESP-AT C6: the facade's status() only knows connected/disconnected, so say what the
@@ -56162,6 +57350,9 @@ static void refreshSettingsSectionSubtitles() {
     char nm_vis[48];
     copyUtf8ReplacingMissingGlyphs(&g_font_12, nm_vis, sizeof(nm_vis), nm);
     char sub[72];
+#if defined(WADA_MESHTASTIC)
+    snprintf(sub, sizeof(sub), "%.40s", nm_vis);
+#else
     if (prefs) {
       snprintf(sub, sizeof(sub), "%.22s · share %s · path m%u", nm_vis,
                prefs->advert_loc_policy ? "on" : "off",
@@ -56169,9 +57360,14 @@ static void refreshSettingsSectionSubtitles() {
     } else {
       snprintf(sub, sizeof(sub), "%.40s", nm_vis);
     }
+#endif
     lv_label_set_text(g_set_sec_sub[SEC_PROFILE], sub);
   }
 
+#if defined(WADA_MESHTASTIC)
+  if (g_set_sec_sub[SEC_RADIO] && wadaBackend)
+    lv_label_set_text_fmt(g_set_sec_sub[SEC_RADIO], "%s / %s", wada::regionName(wadaBackend->loraConfig().region), wada::presetName(wadaBackend->loraConfig().modem_preset));
+#else
   if (g_set_sec_sub[SEC_RADIO] && prefs) {
     lv_label_set_text_fmt(g_set_sec_sub[SEC_RADIO], TR("%.3f MHz · SF%u · TX %+ddBm"),
                           static_cast<double>(prefs->freq), static_cast<unsigned>(prefs->sf),
@@ -56179,6 +57375,7 @@ static void refreshSettingsSectionSubtitles() {
   } else if (g_set_sec_sub[SEC_RADIO]) {
     lv_label_set_text(g_set_sec_sub[SEC_RADIO], "—");
   }
+#endif
 
   if (g_set_sec_sub[SEC_AUTOADD] && prefs) {
     unsigned bits = 0;
@@ -56198,7 +57395,7 @@ static void refreshSettingsSectionSubtitles() {
     if (g_lv.task->hasBleCapability() && g_lv.task->isBleEnabled()) {
       lv_label_set_text(g_set_sec_sub[SEC_BLUETOOTH], TR("Active"));
     } else {
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
       lv_label_set_text(g_set_sec_sub[SEC_BLUETOOTH],
                         (g_lv.task->hasBleCapability() && bleRequestedOrEnabled())
                           ? TR("Starting…") : TR("Off"));
@@ -56210,7 +57407,7 @@ static void refreshSettingsSectionSubtitles() {
 
   // Wi-Fi row subtitle: brief connection state (handled on its own dedicated page).
   if (g_set_sec_sub[SEC_WIFI]) {
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
     char ssid[WIFI_CONFIG_SSID_MAX];
     wifiConfigGetSsid(ssid, sizeof(ssid));
     const int re = wifiConfigGetRadioEnabled() ? 1 : 0;
@@ -56230,7 +57427,7 @@ static void refreshSettingsSectionSubtitles() {
 #endif
   }
 
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
   // wifi_sta_status_l is the dedicated Wi-Fi page's status line — created ONLY by
   // buildWifiSettings, for the old modal AND the inline Net sub-tab. The old gate
   // also required g_set_modal.root + kind==Wifi (both modal-only), so the inline
@@ -56357,6 +57554,15 @@ static void ccBackdropCb(lv_event_t* e) {
   if (lv_event_get_code(e) == LV_EVENT_CLICKED) closeControlCenter();
 }
 static void openControlCenter();   // fwd — toggle cbs rebuild the panel
+#if defined(WADA_MESHTASTIC)
+static unsigned s_native_cc_signature = UINT_MAX;
+static unsigned wadaControlState() {
+  if (!wadaBackend) return UINT_MAX;
+  return unsigned(wadaBackend->networkConfig().wifi_enabled) |
+    (unsigned(wadaBackend->bluetoothConfig().enabled) << 1) |
+    (unsigned(wadaBackend->positionSettings().gps_mode) << 2);
+}
+#endif
 
 // Open/close the top-bar "control center" dropdown. On the Tanmatsu the status bar isn't tappable
 // (no touch), so a long-press of the green ○ Home key triggers this (see navPump).
@@ -56365,6 +57571,12 @@ static void toggleControlCenter() { if (s_cc_root) closeControlCenter(); else op
 // Wi-Fi and Bluetooth coexist once allocated. Pager cold starts and
 // re-authentication release and recreate BLE live; no reboot is required.
 static void ccWifiCb(lv_event_t* e) {
+#if defined(WADA_MESHTASTIC)
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  wadaToggleWifi();
+  openControlCenter();
+  return;
+#endif
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
 #if defined(ESP32)
   // Existing stacks apply live in the main loop; a cold Pager temporarily
@@ -56377,6 +57589,17 @@ static void ccWifiCb(lv_event_t* e) {
 #endif
 }
 static void ccBleCb(lv_event_t* e) {
+#if defined(WADA_MESHTASTIC)
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !wadaBackend) return;
+  meshtastic_Config c = {};
+  c.which_payload_variant = meshtastic_Config_bluetooth_tag;
+  c.payload_variant.bluetooth = wadaBackend->bluetoothConfig();
+  c.payload_variant.bluetooth.enabled = !c.payload_variant.bluetooth.enabled;
+  wadaBeforeChange();
+  wadaSettingsResult(wadaBackend->setConfig(c));
+  openControlCenter();
+  return;
+#endif
   if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task ||
       !g_lv.task->hasBleCapability())
     return;
@@ -56397,7 +57620,9 @@ static void ccBleCb(lv_event_t* e) {
 static void ccGpsCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
   g_lv.task->toggleGPS();
+#if !defined(WADA_MESHTASTIC)
   g_lv.task->showAlert(g_lv.task->getGPSState() ? TR("GPS on") : TR("GPS off"), 800);
+#endif
   openControlCenter();   // rebuild so the toggle reflects the new state
 }
 #if !CAP_GPS
@@ -56543,6 +57768,12 @@ static void powerOffCb(lv_event_t* e) {
 #endif
 }
 static void powerOffNow() {
+#ifdef WADA_MESHTASTIC
+  if (g_lv.task) g_lv.task->persistHistoryNow();
+  const bool queued = wadaBackend && wadaBackend->power(true);
+  if (g_lv.task) g_lv.task->showAlert(queued ? TR("Shutdown requested") : TR("Could not queue shutdown"), 2200);
+  return;
+#endif
 #if defined(ESP32)
   WdtHeavyGuard idle_wdt_guard;
   LoopWdtGuard loop_wdt_guard;
@@ -57101,11 +58332,11 @@ static void applyBrightness(uint8_t pct) {
   if (pct > 100) pct = 100;
   s_brightness_pct = pct;
   if (!s_bl_pwm_ready) {
-    ledcSetup(kBlPwmChannel, 20000, 8);              // 20 kHz, 8-bit
-    ledcAttachPin(PIN_TFT_LEDA_CTL, kBlPwmChannel);  // takes the pin over from the display's digitalWrite
+    ledcAttachChannel(PIN_TFT_LEDA_CTL, 20000, 8, kBlPwmChannel);              // 20 kHz, 8-bit
+    // Channel attached above.  // takes the pin over from the display's digitalWrite
     s_bl_pwm_ready = true;
   }
-  ledcWrite(kBlPwmChannel, (uint32_t)pct * 255u / 100u);
+  ledcWriteChannel(kBlPwmChannel, (uint32_t)pct * 255u / 100u);
 }
 #elif defined(HAS_TANMATSU)
 // Tanmatsu: backlights + audio go through the bsp — the CH32 coprocessor (screen +
@@ -57293,6 +58524,9 @@ static bool ccClockStrings(char* clock_s, size_t clock_cap, char* date_s, size_t
   return current;
 }
 static void openControlCenter() {
+#if defined(WADA_MESHTASTIC)
+  s_native_cc_signature = wadaControlState();
+#endif
 #if defined(TLORA_PAGER)
   const bool cc_fresh = (s_cc_root == nullptr);   // not a rebuild after a chip was toggled
 #endif
@@ -57804,7 +59038,11 @@ static void luaStoreInvalidateInstalled() { s_lua_inst_valid = false; }
 
 #if CAP_BUILTIN_LUA_APPS
 #include "lua_builtin.h"   // generated: the catalog's apps, compiled in, raw-deflated
-#include "rom/miniz.h"     // the S3 ROM's tinfl: inflating costs no flash
+#if defined(WADA_MESHTASTIC)
+#include <miniz.h>
+#else
+#include <rom/miniz.h>     // the S3 ROM's tinfl: inflating costs no flash
+#endif
 static bool luaBuiltinHas(const char* id) {
   for (int i = 0; i < kLuaBuiltinCount; i++)
     if (strcmp(kLuaBuiltin[i].id, id) == 0) return true;
@@ -58499,14 +59737,17 @@ static void luaStoreRebuildList() {
     // ==== tab: Built-in — show/hide the stock apps ====
     section(TR("Show in the app drawer"));
     struct { const char* name; uint32_t bit; } builtins[] = {
+#if CAP_RADIO_TOOLS
       { "Spectrum", APPHIDE_SPECTRUM }, { "Discover", APPHIDE_DISCOVER },
-#if !defined(HAS_TANMATSU)
+      { "Signal", APPHIDE_SIGNAL },
+#endif
+#if !defined(HAS_TANMATSU) && CAP_SCREEN_MIRROR
       { "VNC", APPHIDE_VNC }, { "Remote", APPHIDE_REMOTE },
 #endif
-#if defined(MULTI_TRANSPORT_COMPANION) && CAP_WEB_BROWSER
+#if defined(WADA_NETWORK_UI) && CAP_WEB_BROWSER
       { "Web", APPHIDE_READER },
 #endif
-      { "Signal", APPHIDE_SIGNAL }, { "Mentions", APPHIDE_MENTIONS },
+      { "Mentions", APPHIDE_MENTIONS },
 #if defined(HAS_TOUCH_UI)
       { "Terminal", APPHIDE_TERMINAL },
 #endif
@@ -58519,7 +59760,7 @@ static void luaStoreRebuildList() {
 #if CAP_USB_FILES
   { "USB Files", APPHIDE_USB_FILES },
 #endif
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI) && !defined(WADA_MESHTASTIC)
       { "MQTT bridge", APPHIDE_MQTT },   // a Settings section, not a drawer tile
 #endif
     };
@@ -59399,10 +60640,10 @@ struct AppTileDef { const char* icon; const char* label; uint8_t act; uint8_t hu
 static constexpr uint8_t kAppHueDanger = 0xFF;
 static const AppTileDef k_app_tiles[] = {
   { UI_ICON_MESSAGE_SQUARE,     "Chats",     APPACT_CHATS,     HUE_MSG },
-  { UI_ICON_USER,               "Contacts",  APPACT_CONTACTS,  HUE_PEOPLE },
+  { UI_ICON_USER,               "Nodes",     APPACT_CONTACTS,  HUE_PEOPLE },
   { UI_ICON_AT_SIGN,            "Mentions",  APPACT_MENTIONS,  HUE_MSG },
   { UI_ICON_MAP_PIN,            "Map",       APPACT_MAP,       HUE_PLACE },
-  { UI_ICON_RADIO,              "Advertise", APPACT_ADVERT,    HUE_RADIO },
+  { UI_ICON_RADIO,              "Node info", APPACT_ADVERT,    HUE_RADIO },
 #if CAP_RADIO_TOOLS
   { UI_ICON_SIGNAL,             "Signal",    APPACT_SIGNAL,    HUE_RADIO },
   { UI_ICON_RADAR,              "Discover",  APPACT_DISCOVER,  HUE_RADIO },   // active node-discovery sweep
@@ -59416,7 +60657,7 @@ static const AppTileDef k_app_tiles[] = {
   { UI_ICON_CAST,               "VNC",       APPACT_VNC,       HUE_SYS },     // browser screen mirror
 #endif
   { UI_ICON_SLIDERS_HORIZONTAL, "Settings",  APPACT_SETTINGS,  HUE_SYS },     // "!" when an update waits
-#if defined(MULTI_TRANSPORT_COMPANION) && CAP_WEB_BROWSER
+#if defined(WADA_NETWORK_UI) && CAP_WEB_BROWSER
   { UI_ICON_GLOBE,              "Web",       APPACT_READER,    HUE_PLACE },   // on-device text browser
 #endif
 #if CAP_FILESYSTEM || defined(TLORA_PAGER)
@@ -59590,6 +60831,11 @@ static void openThreadDetailByIdx(int idx, bool channel) {
 
 // Open a configured hashtag channel by its derived secret, or offer the join form.
 static void openHashtagChat(const char* tag) {
+#if defined(WADA_MESHTASTIC)
+  (void)tag;
+  openSettingsCategory(CAT_CHANNELS);
+  return;
+#endif
   char hashed[42];
   uint8_t secret[16];
   if (!deriveHashtagChannelKey(tag, hashed, sizeof(hashed), secret)) {
@@ -59803,7 +61049,7 @@ static void appLaunch(int act, lv_event_t* e) {
     case APPACT_VNC:       openVncPage();        return;   // screen mirror + remote control from a browser
     case APPACT_REMOTE:    openRemotePage();     return;   // reboot into the web-resolution headless UI
 #endif
-#if defined(MULTI_TRANSPORT_COMPANION) && CAP_WEB_BROWSER
+#if defined(WADA_NETWORK_UI) && CAP_WEB_BROWSER
     case APPACT_READER:    openReaderPage();     return;   // on-device text browser (no proxy)
 #endif
     case APPACT_ADVERT:    openAdvertModalCb(e);  return;
@@ -59814,7 +61060,7 @@ static void appLaunch(int act, lv_event_t* e) {
     // appears as a regular installed tile (the native module goes unreferenced
     // here, so the linker drops it).
 #else
-    case APPACT_SNAKE:     SnakeGame::launch();  return;
+    case APPACT_SNAKE:     WadaSnakeGame::launch();  return;
 #endif
 #if defined(HAS_TOUCH_UI)
     case APPACT_TERMINAL:  homeTerminalCb(e);    return;
@@ -60755,7 +62001,7 @@ static void docCaptureTour() {
     docSettle(30); captureScreenToSerial("app_rfmonitor"); luaAppDismiss(); docSettle(8);
   }
 #endif
-#if defined(MULTI_TRANSPORT_COMPANION) && CAP_WEB_BROWSER
+#if defined(WADA_NETWORK_UI) && CAP_WEB_BROWSER
   // On-device web browser (8 MB boards only) + the chat-link menu + the QR popup.
   // The reader renders from the UI-update poll (which doesn't run while this tour
   // blocks the loop), so drive the fetch-wait + render inline here.
@@ -61548,7 +62794,7 @@ static void chatHeaderSubtitle(char* out, size_t cap) {
       if (!(m.meta_flags & UITask::MSG_META_HAS_RX)) break;
       if ((m.meta_flags & UITask::MSG_META_IS_FLOOD) && m.path_len != 0xFF) {
         const unsigned hops = m.path_len & 0x3F;
-        if (hops == 0) snprintf(out, cap, "%s", TR("Direct, no repeaters"));
+        if (hops == 0) snprintf(out, cap, "%s", TR("Direct (0 hops)"));
         else snprintf(out, cap, "%u %s", hops, hops == 1 ? TR("hop away") : TR("hops away"));
       } else {
         snprintf(out, cap, "%s", TR("Routed"));
@@ -62197,6 +63443,9 @@ static void updateGlobalStatusBar() {
 
   // ---- Left zone ----
   bool unread_badge = false;   // set true only by the branches that render the ✉ count
+#if defined(WADA_MESHTASTIC)
+  s_native_identity_name = false;
+#endif
   // A full-screen tool page (RF Monitor / Spectrum / Send advert) wins the title + Back chevron,
   // even when opened from inside a settings detail — matches statusBarTapCb routing (apppage first).
   const char* app_page_title = s_apppage_title ? s_apppage_title
@@ -62357,6 +63606,9 @@ static void updateGlobalStatusBar() {
       s_left_home_name[0] = '\0';   // force the window re-config if the name returns
       s_left_home_cfg = false;
     } else if (tab == HOME_TAB_INDEX) {
+#if defined(WADA_MESHTASTIC)
+      s_native_identity_name = true;
+#endif
       // Home: the node's name, in a fixed window that scrolls a name too long for
       // it, so it never runs into the clock or the status icons. Reconfigured only
       // when the name changes (re-setting the scroll every tick would restart it).
@@ -62391,16 +63643,19 @@ static void updateGlobalStatusBar() {
     }
   }
 
-  // Activate the unread→Chats shortcut only while the ✉ count is shown; other
-  // left-zone states (Back chevron, profile name, OSM credit, blank) keep the
-  // bar's normal control-center / Back tap.
+  // The unread badge opens Chats; the native own-name surface opens its identity menu.
+  // Back chevrons, attribution and blank states retain the bar's normal handling.
   if (g_statusbar.left_label) {
-    if (unread_badge) lv_obj_add_flag(g_statusbar.left_label, LV_OBJ_FLAG_CLICKABLE);
+    if (unread_badge
+#if defined(WADA_MESHTASTIC)
+        || s_native_identity_name
+#endif
+    ) lv_obj_add_flag(g_statusbar.left_label, LV_OBJ_FLAG_CLICKABLE);
     else              lv_obj_clear_flag(g_statusbar.left_label, LV_OBJ_FLAG_CLICKABLE);
   }
 
   // ---- Connection icon ----
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
   const bool wifi_up = (WiFi.status() == WL_CONNECTED);
   const bool ble_up  = g_lv.task->hasBleCapability() && g_lv.task->isBleEnabled();
   // Wi-Fi and Bluetooth are independent glyphs now (Wi-Fi right of Bluetooth),
@@ -64682,6 +65937,15 @@ static void hwRadioBuild(int i) {
   else hwCardBuild(i, UI_ICON_ANTENNA, COLOR_HUE[HUE_RADIO], 0xFF, true);   // no airtime bar: it read as a stray line
 }
 static void hwRadioUpdate(int i) {
+#if defined(WADA_MESHTASTIC)
+  if(wadaBackend){
+    const auto& native=wadaBackend->loraConfig();char detail[96];
+    snprintf(detail,sizeof(detail),"Hop %u | TX %s | slot %u",(unsigned)native.hop_limit,native.tx_enabled?"on":"off",(unsigned)native.channel_num);
+    if(hwI(i).size==HWS_S)hwStatSet(i,wada::presetName(native.modem_preset),wada::regionName(native.region),COLOR_TEXT);
+    else hwCardSet(i,wada::presetName(native.modem_preset),wada::regionName(native.region),detail);
+    return;
+  }
+#endif
   const NodePrefs* p = the_mesh.getNodePrefs();
   if (!p) return;
   char f[24], bw[12], a[64], b[96];
@@ -65036,7 +66300,7 @@ static bool hwSensorsAvail(uint8_t) { return sensorsUiWanted(); }
 // ---- Links ----------------------------------------------------------------------------
 // Wi-Fi, Bluetooth, the phone app and the MQTT bridge. Never the pairing code:
 // anyone reading the screen could pair with it.
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
 struct HwLinks { bool wifi_on, wifi_up, bt_on, app, app_bt, app_wifi; int rssi; int mqtt; char ssid[33]; };
 static void hwLinksRead(HwLinks& k) {
   k.wifi_on = wifiConfigGetRadioEnabled();
@@ -65049,9 +66313,13 @@ static void hwLinksRead(HwLinks& k) {
   char peer[20];
   k.app_bt = k.app && g_lv.task->getBlePeerAddress(peer, sizeof peer);
   k.app_wifi = k.app && !k.app_bt && g_lv.task->getWsConnectedCount() > 0;
+#if !defined(WADA_MESHTASTIC)
   MqttBridgeStatus st;
   mqtt_bridge.getStatus(st);
   k.mqtt = !st.available || !st.requestedEnabled ? 0 : st.phase == MqttBridgePhase::Connected ? 2 : 1;
+#else
+  k.mqtt = 0; // The legacy MQTT bridge is unavailable; Meshtastic owns MQTT.
+#endif
 }
 static void hwLinksBuild(int i) {
   HwInst& w = hwI(i);
@@ -65135,12 +66403,12 @@ static void hwAdvertBuild(int i) {
   lv_obj_center(w.l[0]);
   w.l[1] = hwLine(w.box, &g_font_12, COLOR_TEXT, w.pw + 2 * SC(2));
   lv_obj_set_style_text_align(w.l[1], LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-  lv_label_set_text(w.l[1], w.size == HWS_S ? TR("Advert") : TR("Send advert"));
+  lv_label_set_text(w.l[1], w.size == HWS_S ? TR("Node info") : TR("Send node info"));
   lv_obj_set_pos(w.l[1], -SC(2), y0 + chip + SC(4));
   if (cap) {
     w.l[2] = hwLine(w.box, &g_font_12, COLOR_SUB, w.pw + 2 * SC(2));
     lv_obj_set_style_text_align(w.l[2], LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_label_set_text(w.l[2], w.size == HWS_S ? (flood ? TR("flood") : TR("nearby"))
+    lv_label_set_text(w.l[2], w.size == HWS_S ? (flood ? TR("mesh hops") : TR("one hop"))
                                               : (flood ? TR("across the mesh") : TR("to nodes in range")));
     lv_obj_set_pos(w.l[2], -SC(2), y0 + chip + SC(4) + lab_h);
   }
@@ -65149,6 +66417,26 @@ static void hwRingAnim(void* o, int32_t v) {
   lv_obj_set_style_outline_width((lv_obj_t*)o, (lv_coord_t)(v * SC(10) / 255), LV_PART_MAIN);
   lv_obj_set_style_outline_opa((lv_obj_t*)o, (lv_opa_t)(255 - v), LV_PART_MAIN);
 }
+#if defined(WADA_MESHTASTIC)
+static void hwAdvertTap(int i, lv_event_t*) {
+  if (!g_lv.task) return;
+  const bool flood = hwR(i).opt == 1;
+  const bool ok = wadaBackend->sendNodeInfo(!flood,false);
+  g_lv.task->showAlert(ok ? TR("Node info queued") : TR("Could not queue node info"), 1200);
+  if (!ok || kHwEpaper) return;
+  lv_obj_t* b = hwI(i).box;
+  lv_obj_set_style_outline_color(b, lv_color_hex(COLOR_GLOW), LV_PART_MAIN);
+  lv_obj_set_style_outline_pad(b, 0, LV_PART_MAIN);
+  lv_anim_t a;
+  lv_anim_init(&a);
+  lv_anim_set_var(&a, b);
+  lv_anim_set_exec_cb(&a, hwRingAnim);
+  lv_anim_set_values(&a, 0, 255);
+  lv_anim_set_time(&a, 700);
+  lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+  lv_anim_start(&a);
+}
+#else
 static void hwAdvertTap(int i, lv_event_t*) {
   if (!g_lv.task) return;
   const bool flood = hwR(i).opt == 1;
@@ -65167,6 +66455,7 @@ static void hwAdvertTap(int i, lv_event_t*) {
   lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
   lv_anim_start(&a);
 }
+#endif
 static void hwAdvertSend0() { if (s_hw_sel >= 0) { s_hw.w[s_hw_sel].opt = 0; s_hw_dirty = true; hwQueueRebuild(); } }
 static void hwAdvertSend1() { if (s_hw_sel >= 0) { s_hw.w[s_hw_sel].opt = 1; s_hw_dirty = true; hwQueueRebuild(); } }
 static void hwAdvertOptions(int i, ActItem* it, int& n) {
@@ -65268,7 +66557,7 @@ static void hwAppTap(int i, lv_event_t* e) {
 enum : uint8_t { HWT_WIFI = 1, HWT_BT, HWT_GPS, HWT_DND, HWT_SOUND, HWT_KBLIGHT, HWT_COUNT };
 static bool hwToggleAvail(uint8_t id) {
   switch (id) {
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
     case HWT_WIFI:    return true;
     case HWT_BT:      return g_lv.task && g_lv.task->hasBleCapability();
 #endif
@@ -65307,7 +66596,7 @@ static const char* hwToggleName(uint8_t id) {
 }
 static bool hwToggleOn(uint8_t id) {
   switch (id) {
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
     case HWT_WIFI: return wifiConfigGetRadioEnabled();
     case HWT_BT: return bleRequestedOrEnabled();
 #endif
@@ -65327,11 +66616,15 @@ static bool hwToggleOn(uint8_t id) {
 static void hwToggleFlip(uint8_t id) {
   if (!g_lv.task) return;
   switch (id) {
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
     case HWT_WIFI: {
+#if defined(WADA_MESHTASTIC)
+      wadaToggleWifi();
+#else
       const bool on = wifiConfigGetRadioEnabled();
       if (!on && !wifiPrepareEnable()) return;
       wifiRadioSwitch(!on);   // the same path as the Settings switch, rejoin included
+#endif
       break;
     }
     case HWT_BT:
@@ -65695,6 +66988,15 @@ static HwRemote* hwRemoteFor(const uint8_t* key, bool make) {
   return free_slot;
 }
 static bool hwRemoteAsk(const uint8_t* key) {
+#if defined(WADA_MESHTASTIC)
+  ContactInfo contact{};
+  if (!wadaBackend || hwFindContact(key, 6, &contact) < 0) return false;
+  HwRemote* remote = hwRemoteFor(key, true);
+  remote->asked_ms = millis();
+  remote->pending = wadaBackend->requestTelemetry(WadaMeshtasticBackend::keyNode(contact.id.pub_key), wada::TelemetryKind::Device);
+  if (remote->pending) markMeshRequest();
+  return remote->pending;
+#else
   if (the_mesh.hasUIRequestPending() || the_mesh.getRemainingTxBudget() < 300) return false;
 #if CAP_SD || defined(TLORA_PAGER)
   if (s_telem_manual_pending) return false;
@@ -65707,6 +67009,7 @@ static bool hwRemoteAsk(const uint8_t* key) {
   r->pending = res == MSG_SEND_SENT_FLOOD || res == MSG_SEND_SENT_DIRECT;
   if (r->pending) markMeshRequest();
   return r->pending;
+#endif
 }
 // From UITask::onTelemetryReply: true when the reply was one Home asked for (the
 // caller then keeps it out of a toast).
@@ -65746,19 +67049,62 @@ static void hwRemoteTick(uint32_t now) {
     if (hwRemoteAsk(rec.x)) return;   // one ask per pass
   }
 }
+#if defined(WADA_MESHTASTIC)
+static bool wadaDeviceWidgetReading(const meshtastic_NodeInfo* node, char* detail, size_t detailCap, char* value, size_t valueCap) {
+  detail[0] = value[0] = '\0';
+  if (!node || !node->has_device_metrics) return false;
+  const auto& metrics = node->device_metrics;
+  const bool voltage = metrics.has_voltage && isfinite(metrics.voltage);
+  if (voltage) {
+    snprintf(value, valueCap, "%.2f V", double(metrics.voltage));
+    snprintf(detail, detailCap, "%s", value);
+  }
+  if (metrics.has_battery_level) {
+    char battery[32];
+    if (metrics.battery_level > 100) snprintf(battery, sizeof(battery), "%s", TR("External power"));
+    else snprintf(battery, sizeof(battery), TR("%u%% battery"), unsigned(metrics.battery_level));
+    const size_t used = strlen(detail);
+    snprintf(detail + used, detailCap - used, "%s%s", used ? " \xC2\xB7 " : "", battery);
+    if (!voltage) snprintf(value, valueCap, "%s", battery);
+  }
+  if (!detail[0]) snprintf(detail, detailCap, "%s", TR("No device readings reported"));
+  return true;
+}
+#endif
+
 static void hwRemoteBuild(int i) {
-  if (hwI(i).size == HWS_S) hwStatBuild(i, UI_ICON_THERMOMETER, COLOR_HUE[HUE_PLACE]);
-  else hwCardBuild(i, UI_ICON_THERMOMETER, COLOR_HUE[HUE_PLACE], 0xFF);
+#if defined(WADA_MESHTASTIC)
+  const char* icon = LV_SYMBOL_BATTERY_3;
+#else
+  const char* icon = UI_ICON_THERMOMETER;
+#endif
+  if (hwI(i).size == HWS_S) hwStatBuild(i, icon, COLOR_HUE[HUE_PLACE]);
+  else hwCardBuild(i, icon, COLOR_HUE[HUE_PLACE], 0xFF);
 }
 static void hwRemoteUpdate(int i) {
   const HwRec& rec = hwR(i);
   char nm[40], tag[24] = "", det[96] = "", a[24];
   if (!(rec.x[0] | rec.x[1] | rec.x[2])) {
     if (hwI(i).size == HWS_S) hwStatSet(i, "--", TR("choose a node"), COLOR_SUB);
+#if defined(WADA_MESHTASTIC)
+    else hwCardSet(i, TR("Remote device"), nullptr, TR("Hold to choose a node"), COLOR_SUB);
+#else
     else hwCardSet(i, TR("Remote sensor"), nullptr, TR("Hold to choose a node"), COLOR_SUB);
+#endif
     return;
   }
   hwNodeName(rec.x, 6, nm, sizeof nm);
+#if defined(WADA_MESHTASTIC)
+  {
+    ContactInfo contact{};
+    const auto* node = wadaBackend && hwFindContact(rec.x, 6, &contact) >= 0 ?
+      wadaBackend->nodeInfo(WadaMeshtasticBackend::keyNode(contact.id.pub_key)) : nullptr;
+    const bool have = wadaDeviceWidgetReading(node, det, sizeof(det), a, sizeof(a));
+    if (hwI(i).size == HWS_S) hwStatSet(i, a[0] ? a : "--", nm, have ? COLOR_TEXT : COLOR_SUB);
+    else hwCardSet(i, nm, TR("Device metrics"), have ? det : TR("No device readings yet"));
+    return;
+  }
+#endif
   HwRemote* r = hwRemoteFor(rec.x, false);
   const bool have = r && r->got_ms;
   if (have) hwFmtAgo(tag, sizeof tag, (millis() - r->got_ms) / 1000u);
@@ -65782,7 +67128,11 @@ static void hwRemoteTap(int i, lv_event_t*) {
   const HwRec& rec = hwR(i);
   if (!(rec.x[0] | rec.x[1] | rec.x[2])) { hwArrangeOpen(i); return; }
   if (!g_lv.task) return;
+#if defined(WADA_MESHTASTIC)
+  hwRemoteAsk(rec.x);
+#else
   g_lv.task->showAlert(hwRemoteAsk(rec.x) ? TR("Asking for its readings") : TR("Busy, try again in a moment"), 1400);
+#endif
 }
 
 // ---- Sun and moon -----------------------------------------------------------------------
@@ -65799,7 +67149,7 @@ static void hwSunUpdate(int i) {
   time_t now;
   if (!hwLocalTime(v, &now) || !hwHavePosition(lat, lon)) {
     if (w.size == HWS_S) hwStatSet(i, "--", TR("no position"), COLOR_SUB);
-    else hwCardSet(i, TR("No position yet"), nullptr, TR("Set one in Profile, or turn on GPS"), COLOR_SUB);
+    else hwCardSet(i, TR("No position yet"), nullptr, TR("Set a fixed position or enable GPS in Settings"), COLOR_SUB);
     return;
   }
   const bool tomorrow = w.t_ms && millis() - w.t_ms < 5000u;
@@ -65919,10 +67269,19 @@ static void hwPositionUpdate(int i) {
 #else
   const unsigned fuzz = 0;
 #endif
+#if defined(WADA_MESHTASTIC)
+  if (wadaBackend) {
+    const auto &position = wadaBackend->positionSettings();
+    if (position.position_broadcast_secs)
+      snprintf(det, sizeof(det), TR("Position interval: %u s"), unsigned(position.position_broadcast_secs));
+    else snprintf(det, sizeof(det), "%s", TR("Position schedule: firmware default"));
+  } else snprintf(det, sizeof(det), "%s", TR("Position settings are synchronizing"));
+#else
   if (!shared)        snprintf(det, sizeof det, "%s", TR("Not in your adverts"));
   else if (!fuzz)     snprintf(det, sizeof det, "%s", TR("Adverts share it exactly"));
   else if (fuzz >= 1000) snprintf(det, sizeof det, TR("Adverts share it to %u km"), fuzz / 1000);
   else                snprintf(det, sizeof det, TR("Adverts share it to %u m"), fuzz);
+#endif
   if (w.size == HWS_S) {
     if (!have)       hwStatSet(i, "--", TR("no position"), COLOR_SUB);
     else if (!shown) hwStatSet(i, "\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2", TR("hidden"), COLOR_SUB);
@@ -66403,7 +67762,11 @@ static const HwKindDef k_hw_kinds[] = {
   { HWK_MENTIONS, HWG_MSG,   HWSML, HWS_S, "Mentions",      UI_ICON_AT_SIGN,     nullptr,        hwMentionsBuild, hwMentionsUpdate, hwMentionsTap, nullptr },
   { HWK_HEARD,    HWG_MESH,  HWSM,  HWS_M, "Heard",         UI_ICON_USERS,       nullptr,        hwHeardBuild,    hwHeardUpdate,    hwHeardTap,    nullptr },
   { HWK_NEAREST,  HWG_MESH,  HWSM,  HWS_M, "Nearest",       UI_ICON_RADIO_TOWER, nullptr,        hwNearestBuild,  hwNearestUpdate,  hwNearestTap,  nullptr },
+#if defined(WADA_MESHTASTIC)
+  { HWK_REMOTE,   HWG_MESH,  HWSM,  HWS_M, "Remote device", LV_SYMBOL_BATTERY_3, nullptr,        hwRemoteBuild,   hwRemoteUpdate,   hwRemoteTap,   hwRemoteOptions },
+#else
   { HWK_REMOTE,   HWG_MESH,  HWSM,  HWS_M, "Remote sensor", UI_ICON_THERMOMETER, nullptr,        hwRemoteBuild,   hwRemoteUpdate,   hwRemoteTap,   hwRemoteOptions },
+#endif
 #if defined(HW_HAVE_RADAR)
   { HWK_RADAR,    HWG_MESH,  HWSZ(HWS_M) | HWSZ(HWS_L), HWS_L, "Mesh radar", UI_ICON_RADAR,    nullptr,        hwRadarBuild,    hwRadarUpdate,    hwRadarTap,    nullptr },
 #endif
@@ -66419,10 +67782,10 @@ static const HwKindDef k_hw_kinds[] = {
 #if defined(HAS_EXPANSION_KIT)
   { HWK_SENSORS,  HWG_POWER, HWSML, HWS_M, "Sensors",       UI_ICON_THERMOMETER, hwSensorsAvail, hwSensorsBuild,  hwSensorsUpdate,  hwSensorsTap,  nullptr },
 #endif
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
   { HWK_LINKS,    HWG_LINKS, HWSM,  HWS_S, "Links",         UI_ICON_WIFI,        nullptr,        hwLinksBuild,    hwLinksUpdate,    hwLinksTap,    nullptr },
 #endif
-  { HWK_ADVERT,   HWG_SHORT, HWSM,  HWS_S, "Advert",        UI_ICON_RADIO,       nullptr,        hwAdvertBuild,   nullptr,          hwAdvertTap,   hwAdvertOptions },
+  { HWK_ADVERT,   HWG_SHORT, HWSM,  HWS_S, "Node info",        UI_ICON_RADIO,       nullptr,        hwAdvertBuild,   nullptr,          hwAdvertTap,   hwAdvertOptions },
   { HWK_APP,      HWG_SHORT, HWSZ(HWS_S), HWS_S, "App",     UI_ICON_LAYOUT_GRID, hwAppAvail,     hwAppBuild,      nullptr,          hwAppTap,      hwAppOptions },
   { HWK_TOGGLES,  HWG_SHORT, HWSZ(HWS_M), HWS_M, "Switches", UI_ICON_SLIDERS_HORIZONTAL, nullptr, hwTogglesBuild, hwTogglesUpdate,  nullptr,       hwTogglesOptions },
 #if CAP_LUA_APPS && CAP_LUA_SDK_EXT
@@ -66437,6 +67800,9 @@ static const HwKindDef* hwKind(uint8_t kind) {
 }
 static uint8_t hwKindSizes(uint8_t kind) { const HwKindDef* d = hwKind(kind); return d ? d->sizes : 0; }
 static bool hwKindAvail(uint8_t kind, uint8_t opt) {
+#if defined(WADA_MESHTASTIC)
+  if (kind == HWK_NEAREST || kind == HWK_AIRTIME) return false;
+#endif
   const HwKindDef* d = hwKind(kind);
   return d && (!d->avail || d->avail(opt));
 }
@@ -67260,6 +68626,9 @@ static void refreshStatusLabels() {
   // overlay (not a tab), so this periodic tick is what keeps its GPS line and the
   // CPU/RAM/PSRAM/IP line current — e.g. the IP appears/clears as Wi-Fi
   // connects/drops, without having to close and reopen the panel.
+#if defined(WADA_MESHTASTIC)
+  if (s_cc_root && s_native_cc_signature != wadaControlState()) openControlCenter();
+#endif
   if (s_cc_root) {
     if (s_cc_gps_label) setLabelIfChanged(s_cc_gps_label, gpsStatusStr(true));
     if (s_cc_clock_label && s_cc_date_label) {
@@ -67293,7 +68662,7 @@ static void refreshStatusLabels() {
   // when the tab is actually visible. Cheap, but no point doing it on every
   // tick if the user is somewhere else.
   if (active_tab == MAP_TAB_INDEX) { mapAutoFollowTick(); refreshMapInfoLabel(); }
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
   // Reader (text browser): the fetch worker publishes text/status via s_reader_dirty.
   // The page is a full-screen overlay (any tab), so gate on the page being open.
   if (s_reader_dirty && s_reader_root) {
@@ -67829,7 +69198,7 @@ static void setupFinishCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   kbMirrorSyncToReal();
   touchPrefsSetSetupDone(true);   // mark done so the wizard won't reappear on next boot
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
   if (s_setup_ssid_ta) {
     char ssid[WIFI_CONFIG_SSID_MAX];
     char pwd[WIFI_CONFIG_PWD_MAX];
@@ -68072,6 +69441,10 @@ static void setupShowStep(int step) {
 }
 
 static void setupWizardOpen() {
+#if defined(WADA_MESHTASTIC)
+  openSettingsCategory(CAT_PROFILE);
+  return;
+#endif
   if (s_setup_root) return;
 #if defined(HAS_M9_KEYBOARD)
   m9NavClear();   // no popping back to a pre-wizard tab from inside first-boot setup
@@ -68105,6 +69478,13 @@ static void sdFallbackNotice() {
       TR("Try the card again"), sdFallbackRetryCb);
 }
 static void setupWizardMaybeOpen() {
+#if defined(WADA_MESHTASTIC)
+  if (touchPrefsGetSetupDone()) return;
+  touchPrefsSetSetupDone(true);
+  if (wadaBackend && wadaBackend->ownsPrefs() && wadaBackend->loraConfig().region == meshtastic_Config_LoRaConfig_RegionCode_UNSET)
+    openSettingsCategory(CAT_RADIO);
+  return;
+#endif
 #if defined(ESP32)
   if (g_sd_fallback_boot) return;   // not a new device: sdFallbackNotice() runs once Home is built
 #endif
@@ -70361,6 +71741,10 @@ static void regionsRenderList() {
 }
 
 static void openRegionsModal() {
+#if defined(WADA_MESHTASTIC)
+  openSettingsCategory(CAT_RADIO);
+  return;
+#endif
   regionsModalClose();
   const lv_coord_t sw = lv_disp_get_hor_res(nullptr);
   const lv_coord_t sh = lv_disp_get_ver_res(nullptr);
@@ -70570,6 +71954,13 @@ static void chanScopeBlockedCb(lv_event_t* e) {
 }
 
 static void openChannelScopeModal(int slot, const char* name) {
+#if defined(WADA_MESHTASTIC)
+  (void)name;
+  chanScopeClose();
+  wadaSelectedChannel = slot >= 0 && slot < 8 ? slot : 0;
+  openSettingsCategory(CAT_CHANNELS);
+  return;
+#endif
   chanScopeClose();
   s_chanscope_slot = slot;
   snprintf(s_chanscope_name, sizeof s_chanscope_name, "%s", (name && name[0]) ? name : "");
@@ -71977,6 +73368,9 @@ static void telemetryPollSet(const uint8_t* key6, int interval_min, int requests
   telemetryPollSave();
 }
 static void telemetryPollTick(uint32_t now_ms) {
+#if defined(WADA_MESHTASTIC)
+  return;
+#endif
   if (SD.cardType() == CARD_NONE) return;
   // Hold auto-poll while a manual request is awaiting its reply — an auto-poll
   // REQ would overwrite the manual request's pending tag and orphan its reply.
@@ -72481,6 +73875,9 @@ static void openTelemetryConfigWindow() {
 // fields the payload contains (voltage / temperature / humidity / pressure /
 // GPS / etc). Unknown channels are skipped via LPPReader::skipData.
 void UITask::onTelemetryReply(const ContactInfo& contact, const uint8_t* data, size_t len) {
+#if defined(WADA_MESHTASTIC)
+  return;
+#endif
   s_ui_ping_deadline_ms = 0;  // reply arrived, cancel timeout
 #if defined(HAS_TOUCH_UI)
   // A Remote sensor widget on Home asked for this: it takes the readings, and the
@@ -73986,7 +75383,9 @@ bool luaHostSdReadFailed() { return sdReadFailedCardDead(); }
 // through the standard pointer-to-member route rather than by guessing drive 0.
 // Declared by hand like f_mkfs above: ff.h drags FatFs' BYTE/WORD typedefs into
 // this file. FRESULT is an int-sized enum and FR_OK is 0.
+#if !defined(WADA_MESHTASTIC)
 extern "C" int f_chmod(const char* path, uint8_t attr, uint8_t mask);
+#endif
 bool luaHostSdClearAttributes(const char* path) {
   if (!s_sd_mounted || !path || path[0] != '/') return false;
   char ffpath[200];
@@ -74002,6 +75401,12 @@ bool luaHostSdClearAttributes(const char* path) {
 // rest of the UI uses to name a node, and it is what an app needs to line up a
 // contact with a discovery hit or an overheard advert.
 static void luaPubkeyHex(const uint8_t* pk, int n, char* out, size_t cap) {
+#if defined(WADA_MESHTASTIC)
+  if(n >= 4) {
+    const uint32_t node=uint32_t(pk[0])|(uint32_t(pk[1])<<8)|(uint32_t(pk[2])<<16)|(uint32_t(pk[3])<<24);
+    snprintf(out,cap,"!%08lx",(unsigned long)node);return;
+  }
+#endif
   static const char* H = "0123456789abcdef";
   size_t o = 0;
   for (int i = 0; i < n && o + 2 < cap; i++) {
@@ -74236,7 +75641,11 @@ bool luaHostMeshSendDM(const char* to_name, const char* text, bool* was_room) {
   if (was_room) *was_room = false;
   if (!to_name || !*to_name || !text || !*text) return false;
   char unshaped[MAX_TEXT_LEN + 1];   // an app's text field shapes Arabic too (#582)
+#if defined(WADA_MESHTASTIC)
+  if (!wadaNormalizeMessage(text, unshaped, sizeof(unshaped), false)) return false;
+#else
   arabicUnshape(text, unshaped, sizeof(unshaped));
+#endif
   text = unshaped;
   ContactInfo* by = nullptr;
   const uint32_t n = the_mesh.getNumContacts();
@@ -74299,7 +75708,11 @@ void luaHostRequestDmSendPerm(const char* app_id, const char* app_name) {
 bool luaHostMeshSendChannel(const char* chan_name, const char* text) {
   if (!chan_name || !*chan_name || !text || !*text) return false;
   char unshaped[MAX_TEXT_LEN + 1];   // an app's text field shapes Arabic too (#582)
+#if defined(WADA_MESHTASTIC)
+  if (!wadaNormalizeMessage(text, unshaped, sizeof(unshaped), false)) return false;
+#else
   arabicUnshape(text, unshaped, sizeof(unshaped));
+#endif
   text = unshaped;
   for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
     ChannelDetails cd;
@@ -74832,12 +76245,28 @@ bool UITask::loadMsgsFromStorage() {
     const int c = (i - oldest + file_slots) % file_slots;   // chronological rank (0 = oldest)
     if (c < drop || c >= n_file) continue;                  // empty slot / outside the kept window
     UIMessage& d = _ui_msgs[c - drop];
+    memset(d.native_channel_identity, 0, sizeof(d.native_channel_identity));
+    memset(d.native_conversation_id, 0, sizeof(d.native_conversation_id));
     d.ts        = m.ts;
     d.channel   = m.channel != 0;
     d.outgoing  = m.outgoing != 0;
     d.meta_flags = m.meta_flags;
     d.path_len   = m.path_len;
-    d.snr_q4     = m.snr_q4;
+#if defined(WADA_MESHTASTIC)
+    d.snr_q4     = d.outgoing ? 0 : m.snr_q4;
+#else
+    d.snr_q4 = m.snr_q4;
+#endif
+#if defined(WADA_MESHTASTIC)
+    d.ack_hash = m.ack_hash;
+    d.deliv_state = WadaDeliveryUI::restored(m.deliv_state);
+    d.delivery_error = d.outgoing ? static_cast<uint8_t>(m.snr_q4) : 0;
+    if (d.deliv_state != m.deliv_state) d.delivery_error = WadaDelivery::Interrupted;
+#else
+    d.ack_hash = 0;
+    d.deliv_state = DELIV_NONE;
+    d.delivery_error = 0;
+#endif
     d.rssi       = m.rssi;
     strncpy(d.thread, m.thread, MAX_THREAD_NAME);
     d.thread[MAX_THREAD_NAME] = '\0';
@@ -75180,12 +76609,28 @@ bool UITask::loadLegacyHistoryFromStorage() {
   for (int i = 0; i < _ui_msg_cap; ++i) {
     if (i < legacy_slots) {
       if (!readHistoryRec(f, &m, sizeof(m), disk_msg_sz)) { f.close(); return false; }
+      memset(_ui_msgs[i].native_channel_identity, 0, sizeof(_ui_msgs[i].native_channel_identity));
+      memset(_ui_msgs[i].native_conversation_id, 0, sizeof(_ui_msgs[i].native_conversation_id));
       _ui_msgs[i].ts        = m.ts;
       _ui_msgs[i].channel   = m.channel != 0;
       _ui_msgs[i].outgoing  = m.outgoing != 0;
       _ui_msgs[i].meta_flags = m.meta_flags;
       _ui_msgs[i].path_len   = m.path_len;
-      _ui_msgs[i].snr_q4     = m.snr_q4;
+#if defined(WADA_MESHTASTIC)
+      _ui_msgs[i].snr_q4     = m.outgoing ? 0 : m.snr_q4;
+#else
+      _ui_msgs[i].snr_q4 = m.snr_q4;
+#endif
+#if defined(WADA_MESHTASTIC)
+      _ui_msgs[i].ack_hash = m.ack_hash;
+      _ui_msgs[i].deliv_state = WadaDeliveryUI::restored(m.deliv_state);
+      _ui_msgs[i].delivery_error = m.outgoing ? static_cast<uint8_t>(m.snr_q4) : 0;
+      if (_ui_msgs[i].deliv_state != m.deliv_state) _ui_msgs[i].delivery_error = WadaDelivery::Interrupted;
+#else
+      _ui_msgs[i].ack_hash = 0;
+      _ui_msgs[i].deliv_state = DELIV_NONE;
+      _ui_msgs[i].delivery_error = 0;
+#endif
       _ui_msgs[i].rssi       = m.rssi;
       strncpy(_ui_msgs[i].thread, m.thread, MAX_THREAD_NAME);
       _ui_msgs[i].thread[MAX_THREAD_NAME] = '\0';
@@ -75240,6 +76685,9 @@ bool UITask::loadHistoryFromStorage() {
       markThreadsDirty(500);
     }
   }
+#if defined(WADA_MESHTASTIC)
+  repairNativeChannelHistory();
+#endif
   // Clear persisted unread counts for threads whose messages are no longer in
   // the ring. The display ring is a fixed-size cache independent of the unread
   // counter; if the device rebooted after ring overflow the counter can be
@@ -75415,8 +76863,17 @@ static void uiSegMarshal(const UITask::UIMessage& s, UiSegMsg* d) {
   d->m.outgoing   = s.outgoing ? 1u : 0u;
   d->m.meta_flags = s.meta_flags;
   d->m.path_len   = s.path_len;
-  d->m.snr_q4     = s.snr_q4;
+#if defined(WADA_MESHTASTIC)
+  // Native outgoing records have no RX SNR. Use that existing byte for the
+  // routing error so v7 record, seq and sender-extension offsets stay unchanged.
+  d->m.snr_q4     = s.outgoing ? static_cast<int8_t>(s.delivery_error) : s.snr_q4;
   d->m.rssi       = s.rssi;
+  d->m.ack_hash   = s.ack_hash;
+  d->m.deliv_state = s.deliv_state;
+#else
+  d->m.snr_q4 = s.snr_q4;
+  d->m.rssi = s.rssi;
+#endif
   strncpy(d->m.thread, s.thread, sizeof(d->m.thread) - 1);
   d->m.thread[sizeof(d->m.thread) - 1] = '\0';
   SenderExtField::store(s.sender, d->m.sender, sizeof(d->m.sender),
@@ -75424,6 +76881,12 @@ static void uiSegMarshal(const UITask::UIMessage& s, UiSegMsg* d) {
   strncpy(d->m.text, s.text, sizeof(d->m.text) - 1);
   d->m.text[sizeof(d->m.text) - 1] = '\0';
   d->seq = s.seq;
+#if defined(WADA_MESHTASTIC)
+  memcpy(d->native_channel_identity, s.native_channel_identity, 32);
+#endif
+#if defined(WADA_MESHTASTIC)
+  memcpy(d->native_conversation_id, s.native_conversation_id, 6);
+#endif
 }
 
 // Chunked record writer shared by append + compact: marshals through a small
@@ -75614,8 +77077,22 @@ static bool uiSegReadRec(File& f, uint16_t disk_sz, UITask::UIMessage* out, uint
   out->outgoing   = rec.m.outgoing != 0;
   out->meta_flags = rec.m.meta_flags;
   out->path_len   = rec.m.path_len;
-  out->snr_q4     = rec.m.snr_q4;
+#if defined(WADA_MESHTASTIC)
+  out->snr_q4     = out->outgoing ? 0 : rec.m.snr_q4;
+  out->delivery_error = out->outgoing ? static_cast<uint8_t>(rec.m.snr_q4) : 0;
+#else
+  out->snr_q4 = rec.m.snr_q4;
+  out->delivery_error = 0;
+#endif
   out->rssi       = rec.m.rssi;
+#if defined(WADA_MESHTASTIC)
+  out->ack_hash = rec.m.ack_hash;
+  out->deliv_state = WadaDeliveryUI::restored(rec.m.deliv_state);
+  if (out->deliv_state != rec.m.deliv_state) out->delivery_error = WadaDelivery::Interrupted;
+#else
+  out->ack_hash = 0;
+  out->deliv_state = UITask::DELIV_NONE;
+#endif
   strncpy(out->thread, rec.m.thread, UITask::MAX_THREAD_NAME);
   out->thread[UITask::MAX_THREAD_NAME] = '\0';
   SenderExtField::load(rec.m.sender, sizeof(rec.m.sender),
@@ -75624,6 +77101,12 @@ static bool uiSegReadRec(File& f, uint16_t disk_sz, UITask::UIMessage* out, uint
   strncpy(out->text, rec.m.text, UITask::MAX_MSG_TEXT);
   out->text[UITask::MAX_MSG_TEXT] = '\0';
   out->seq = rec.seq;
+#if defined(WADA_MESHTASTIC)
+  memcpy(out->native_channel_identity, rec.native_channel_identity, 32);
+#endif
+#if defined(WADA_MESHTASTIC)
+  memcpy(out->native_conversation_id, rec.native_conversation_id, 6);
+#endif
   *seq_out = rec.seq;
   return true;
 }
@@ -76284,6 +77767,13 @@ bool UITask::removeThread(int idx) {
   // thread created later (or a reboot in that window) resurrects the old chat.
   if (purged_any) markMsgsDirty();
 
+#if defined(WADA_MESHTASTIC) && defined(ESP32)
+  if (purged_any || was_channel) {
+    WdtHeavyGuard guard;
+    uiHistWaitWorkerIdle();
+    if (!saveMsgsToStorage()) return false;
+  }
+#endif
   _ui_threads[idx] = UIThread{};
   _ui_threads[idx].used = false;
   _ui_threads[idx].mesh_contact_idx  = -1;
@@ -76305,6 +77795,226 @@ bool UITask::looksLikeKnownChannel(const char* name) const {
   if (!name || !name[0]) return false;
   return name[0] == '#' || strncmp(name, "ch:", 3) == 0 || strncmp(name, "chan:", 5) == 0;
 }
+
+static bool wadaBytesPresent(const uint8_t *bytes, size_t count) {
+  uint8_t any = 0;
+  for (size_t i = 0; i < count; ++i) any |= bytes[i];
+  return any != 0;
+}
+
+bool UITask::ensureNativeChannelConversation(int index) {
+  if (!_ui_threads || index < 0 || index >= MAX_UI_THREADS || !_ui_threads[index].used || !_ui_threads[index].channel) return false;
+  auto &thread = _ui_threads[index];
+  if (wadaBytesPresent(thread.mesh_contact_key6, 6)) return true;
+  for (unsigned attempt = 0; attempt < 128; ++attempt) {
+    esp_fill_random(thread.mesh_contact_key6, 6);
+    if (!wadaBytesPresent(thread.mesh_contact_key6, 6)) continue;
+    bool duplicate = false;
+    for (int t = 0; t < MAX_UI_THREADS; ++t)
+      if (t != index && _ui_threads[t].used && _ui_threads[t].channel &&
+          !memcmp(thread.mesh_contact_key6, _ui_threads[t].mesh_contact_key6, 6)) duplicate = true;
+    if (!duplicate) { markThreadsDirty(200); return true; }
+  }
+  memset(thread.mesh_contact_key6, 0, 6);
+  return false;
+}
+
+void UITask::repairNativeChannelHistory() {
+  if (!_ui_threads || !_ui_msgs) return;
+  for (int t = 0; t < MAX_UI_THREADS; ++t)
+    if (t != _active_thread_idx && _ui_threads[t].used && !_ui_threads[t].channel &&
+        !_ui_threads[t].keep_when_empty && !threadHasMessageHistory(t)) _ui_threads[t].used = false;
+  struct Legacy { char source[MAX_THREAD_NAME + 1]; int owner; };
+  // Bounded scratch on the 32 KiB UI task stack: recovery must not be skipped
+  // when a transient PSRAM allocation fails, leaving old labels attached.
+  Legacy legacy[MAX_UI_THREADS]{};
+  unsigned legacyCount = 0;
+  bool changed = false;
+  auto create = [&](const UIMessage &message, bool tagged) {
+    int slot = -1;
+    for (int t = 0; t < MAX_UI_THREADS; ++t) if (!_ui_threads[t].used) { slot = t; break; }
+    if (slot < 0) return -1;
+    auto &thread = _ui_threads[slot];
+    thread = {};
+    thread.used = thread.channel = true;
+    thread.mesh_channel_slot = thread.mesh_contact_idx = -1;
+    snprintf(thread.name, sizeof(thread.name), "Archived %02u: %.18s", unsigned(slot), message.thread);
+    if (tagged) {
+      memcpy(thread.mesh_contact_pub, message.native_channel_identity, 32);
+      memcpy(thread.mesh_contact_key6, message.native_conversation_id, 6);
+    } else if (!ensureNativeChannelConversation(slot)) { thread.used = false; return -1; }
+    return slot;
+  };
+  for (int i = 0; i < _ui_msg_count; ++i) {
+    auto &message = _ui_msgs[(_ui_msg_head - _ui_msg_count + i + _ui_msg_cap) % _ui_msg_cap];
+    if (!message.channel || !message.thread[0]) continue;
+    const bool tagged = wadaBytesPresent(message.native_conversation_id, 6);
+    int owner = -1;
+    if (tagged) {
+      for (int t = 0; t < MAX_UI_THREADS; ++t)
+        if (_ui_threads[t].used && _ui_threads[t].channel &&
+            !memcmp(_ui_threads[t].mesh_contact_key6, message.native_conversation_id, 6) &&
+            !memcmp(_ui_threads[t].mesh_contact_pub, message.native_channel_identity, 32)) { owner = t; break; }
+    } else {
+      for (unsigned group = 0; group < legacyCount; ++group)
+        if (!strcmp(legacy[group].source, message.thread)) { owner = legacy[group].owner; break; }
+      if (owner < 0) {
+        for (int t = 0; t < MAX_UI_THREADS; ++t)
+          if (_ui_threads[t].used && _ui_threads[t].channel &&
+              !wadaBytesPresent(_ui_threads[t].mesh_contact_pub, 32) &&
+              !wadaBytesPresent(_ui_threads[t].mesh_contact_key6, 6) &&
+              !strcmp(_ui_threads[t].name, message.thread)) { owner = t; break; }
+        if (owner >= 0 && !ensureNativeChannelConversation(owner)) owner = -1;
+        if (owner < 0) owner = create(message, false);
+        if (owner >= 0 && legacyCount < MAX_UI_THREADS) {
+          strlcpy(legacy[legacyCount].source, message.thread, sizeof(legacy[legacyCount].source));
+          legacy[legacyCount++].owner = owner;
+        }
+      }
+    }
+    if (owner < 0) owner = create(message, tagged);
+    if (owner < 0) {
+      strlcpy(message.thread, "Archived: unavailable history", sizeof(message.thread));
+      continue;
+    }
+    auto &thread = _ui_threads[owner];
+    const bool recordChanged = strcmp(message.thread, thread.name) || !tagged;
+    changed = changed || recordChanged;
+    strlcpy(message.thread, thread.name, sizeof(message.thread));
+    memcpy(message.native_channel_identity, thread.mesh_contact_pub, 32);
+    memcpy(message.native_conversation_id, thread.mesh_contact_key6, 6);
+    if (message.ts > thread.last_ts) thread.last_ts = message.ts;
+    if (recordChanged) segMarkSeqDirty(message.seq);
+  }
+  _thread_hist_dirty = true;
+  markThreadsDirty(200);
+  if (changed) markMsgsDirty();
+}
+
+#if defined(WADA_MESHTASTIC)
+bool UITask::channelThreadAvailable(int idx) const {
+  if (!_ui_threads || idx < 0 || idx >= MAX_UI_THREADS || !_ui_threads[idx].used || !_ui_threads[idx].channel || !wadaBackend)
+    return false;
+  const auto &thread = _ui_threads[idx];
+  uint8_t identity[32];
+  return thread.mesh_channel_slot >= 0 && wadaBackend->channelIdentity(thread.mesh_channel_slot, identity) &&
+         !memcmp(identity, thread.mesh_contact_pub, sizeof(identity));
+}
+
+void UITask::refreshNativeChannels() {
+  static int lastActive = -2;
+  static bool lastAvailable = false;
+  ContactInfo activeContact{};
+  const bool available = _active_thread_is_channel ? channelThreadAvailable(_active_thread_idx)
+      : (wadaBackend && lookupActiveContact(activeContact) && wadaBackend->canMessage(WadaMeshtasticBackend::keyNode(activeContact.id.pub_key)));
+  if (lastActive != _active_thread_idx || available != lastAvailable) {
+    lastActive = _active_thread_idx;
+    lastAvailable = available;
+    g_lv.dirty_timeline = true;
+  }
+  if (!_ui_threads || !wadaBackend || !wadaBackend->channelsReady()) return;
+  struct Plan { int slot; bool changed; uint8_t mute; char emoji[20]; char before[MAX_THREAD_NAME + 1], after[MAX_THREAD_NAME + 1]; };
+  // This bounded plan must always run before accepting a channel's new label.
+  Plan plans[MAX_UI_THREADS]{};
+  uint8_t identities[8][32]{};
+  bool valid[8]{}, claimed[8]{};
+  int existingOwner[8];
+  for (auto &owner : existingOwner) owner = -1;
+  ChannelDetails channels[8]{};
+  for (unsigned slot = 0; slot < 8; ++slot)
+    valid[slot] = wadaBackend->channelIdentity(slot, identities[slot]) &&
+                  the_mesh.getChannel(slot, channels[slot]) && channels[slot].name[0];
+  for (int t = 0; t < MAX_UI_THREADS; ++t) {
+    const auto &thread = _ui_threads[t];
+    const int slot = thread.mesh_channel_slot;
+    if (thread.used && thread.channel && slot >= 0 && slot < 8 && valid[slot] && existingOwner[slot] < 0 &&
+        !memcmp(thread.mesh_contact_pub, identities[slot], 32)) existingOwner[slot] = t;
+  }
+  bool changed = false, renamed = false;
+  for (int t = 0; t < MAX_UI_THREADS; ++t) {
+    auto &plan = plans[t];
+    plan = {};
+    plan.slot = -1;
+    auto &thread = _ui_threads[t];
+    if (!thread.used || !thread.channel) continue;
+    strlcpy(plan.before, thread.name, sizeof(plan.before));
+    plan.mute = touchPrefsGetChannelMute(thread.name);
+    touchPrefsGetChannelEmoji(thread.name, plan.emoji, sizeof(plan.emoji));
+    if (!ensureNativeChannelConversation(t)) continue;
+    const int oldSlot = thread.mesh_channel_slot;
+    if (oldSlot >= 0 && oldSlot < 8 && existingOwner[oldSlot] == t) plan.slot = oldSlot;
+    if (plan.slot < 0)
+      for (unsigned slot = 0; slot < 8; ++slot)
+        if (valid[slot] && !claimed[slot] && existingOwner[slot] < 0 && !memcmp(thread.mesh_contact_pub, identities[slot], 32)) {
+          plan.slot = slot;
+          break;
+        }
+    if (plan.slot >= 0) {
+      claimed[plan.slot] = true;
+      strlcpy(plan.after, channels[plan.slot].name, sizeof(plan.after));
+    } else if (!strcmp(thread.name, "Archived: channel during sync")) {
+      strlcpy(plan.after, thread.name, sizeof(plan.after));
+    } else {
+      char prefix[16];
+      snprintf(prefix, sizeof(prefix), "Archived %02u: ", unsigned(t));
+      if (!strncmp(thread.name, prefix, strlen(prefix))) strlcpy(plan.after, thread.name, sizeof(plan.after));
+      else snprintf(plan.after, sizeof(plan.after), "%s%.18s", prefix, thread.name);
+    }
+    plan.changed = strcmp(plan.before, plan.after) != 0;
+    changed |= plan.changed || thread.mesh_channel_slot != plan.slot;
+    thread.mesh_channel_slot = plan.slot;
+  }
+  auto rename = [&](int t, const char *from, const char *to) {
+    strlcpy(_ui_threads[t].name, to, sizeof(_ui_threads[t].name));
+    for (int i = 0; _ui_msgs && i < _ui_msg_cap; ++i) {
+      auto &message = _ui_msgs[i];
+      if (message.channel &&
+          ((!memcmp(message.native_channel_identity, _ui_threads[t].mesh_contact_pub, 32) &&
+            !memcmp(message.native_conversation_id, _ui_threads[t].mesh_contact_key6, 6)) ||
+           (!wadaBytesPresent(message.native_channel_identity, 32) && !wadaBytesPresent(message.native_conversation_id, 6) &&
+            !wadaBytesPresent(_ui_threads[t].mesh_contact_pub, 32) && !strcmp(message.thread, from)))) {
+        strlcpy(message.thread, to, sizeof(message.thread));
+        segMarkSeqDirty(message.seq);
+        renamed = true;
+      }
+    }
+  };
+  // Vacate all old labels before assigning destinations; slot swaps cannot merge histories.
+  for (int t = 0; t < MAX_UI_THREADS; ++t) if (plans[t].changed) {
+    char temporary[MAX_THREAD_NAME + 1];
+    snprintf(temporary, sizeof(temporary), "~native-channel-%02u", unsigned(t));
+    rename(t, plans[t].before, temporary);
+    touchPrefsSetChannelMute(plans[t].before, 0);
+    touchPrefsSetChannelEmoji(plans[t].before, "");
+  }
+  for (int t = 0; t < MAX_UI_THREADS; ++t) if (plans[t].changed) {
+    rename(t, _ui_threads[t].name, plans[t].after);
+    touchPrefsSetChannelMute(plans[t].after, plans[t].mute);
+    touchPrefsSetChannelEmoji(plans[t].after, plans[t].emoji);
+  }
+  for (unsigned slot = 0; slot < 8; ++slot) if (valid[slot] && !claimed[slot]) {
+    const int thread = findOrCreateThread(channels[slot].name, true);
+    if (thread < 0) continue;
+    _ui_threads[thread].mesh_channel_slot = slot;
+    memcpy(_ui_threads[thread].mesh_contact_pub, identities[slot], 32);
+    if (!ensureNativeChannelConversation(thread)) _ui_threads[thread].mesh_channel_slot = -1;
+    changed = true;
+  }
+  if (changed) {
+    _thread_hist_dirty = true;
+    markThreadsDirty(200);
+    if (renamed) markMsgsDirty();
+    g_lv.dirty_threads = g_lv.dirty_timeline = true;
+    ++s_deliv_gen;
+  }
+}
+
+#else
+bool UITask::channelThreadAvailable(int idx) const {
+  return _ui_threads && idx >= 0 && idx < MAX_UI_THREADS && _ui_threads[idx].used &&
+         _ui_threads[idx].channel && _ui_threads[idx].mesh_channel_slot >= 0;
+}
+#endif
 
 void UITask::refreshThreadsFromMesh() {
   // Reclaim DM thread slots that have no message history. These were created
@@ -76388,6 +78098,9 @@ void UITask::refreshThreadsFromMesh() {
       }
     }
   }
+#if defined(WADA_MESHTASTIC)
+  refreshNativeChannels();
+#else
 #ifdef MAX_GROUP_CHANNELS
   ChannelDetails cd;
   for (int i = 0; i < MAX_GROUP_CHANNELS; ++i) {
@@ -76398,6 +78111,7 @@ void UITask::refreshThreadsFromMesh() {
       _ui_threads[t].mesh_channel_slot = static_cast<int16_t>(i);
     }
   }
+#endif
 #endif
 }
 
@@ -76414,6 +78128,10 @@ void UITask::syncThreadMeshSlots(const char* thread_name, bool channel) {
   int t = findThreadByName(thread_name, channel);
   if (t < 0) return;
   if (channel) {
+#if defined(WADA_MESHTASTIC)
+    refreshNativeChannels();
+    return;
+#endif
     _ui_threads[t].mesh_channel_slot = -1;
 #ifdef MAX_GROUP_CHANNELS
     ChannelDetails cd;
@@ -76527,9 +78245,18 @@ int UITask::appendMessage(const char* thread, const char* sender, const char* te
   }
   m.seq = _ui_seq_next++;   // monotonic record id — the segment store keys on it
   m.channel = channel;
+  memset(m.native_channel_identity, 0, sizeof(m.native_channel_identity));
+  memset(m.native_conversation_id, 0, sizeof(m.native_conversation_id));
+#if defined(WADA_MESHTASTIC)
+  if (channel && ensureNativeChannelConversation(t_idx)) {
+    memcpy(m.native_channel_identity, _ui_threads[t_idx].mesh_contact_pub, 32);
+    memcpy(m.native_conversation_id, _ui_threads[t_idx].mesh_contact_key6, 6);
+  }
+#endif
   m.outgoing = outgoing;
   m.ack_hash    = ack_hash;
   m.deliv_state = deliv_state;
+  m.delivery_error = 0;
   m.meta_flags  = meta_flags;
   m.path_len    = path_len;
   m.snr_q4      = snr_q4;
@@ -76565,6 +78292,52 @@ int UITask::appendMessage(const char* thread, const char* sender, const char* te
   return t_idx;
 }
 
+void UITask::onMeshtasticNodeRemoval(uint32_t node, bool removed, const char* reason) {
+#if defined(WADA_MESHTASTIC)
+  for (auto& pending : s_native_clear_pending) {
+    if (!node || pending != node) continue;
+    pending = 0;
+    if (s_native_clear_waiting) --s_native_clear_waiting;
+    if (removed) ++s_native_clear_removed;
+    else {
+      ++s_native_clear_kept;
+      if (reason) snprintf(s_native_clear_reason, sizeof(s_native_clear_reason), "%s", reason);
+    }
+    s_ct_list_force = true;
+    g_lv.dirty_contacts = true;
+    if (!s_native_clear_waiting) wadaClearFinished();
+    return;
+  }
+#endif
+}
+
+#if defined(WADA_MESHTASTIC)
+void UITask::onMeshtasticTelemetry(uint32_t node, uint8_t kind) {
+  if (node == s_native_telem_node && kind == s_native_telem_kind) wadaTelemetryRefresh();
+}
+
+void UITask::onMeshtasticTelemetryStatus(uint32_t node, uint8_t kind, const char* message) {
+  if (!node || kind > uint8_t(wada::TelemetryKind::Host) || !message || !message[0]) return;
+  showAlert(message, 4000);
+}
+
+void UITask::onMeshtasticTrace(const char *report) {
+  s_trace_route_pending = false;
+  openTraceResultPopup(TR("Trace route"), report ? report : TR("No route information was returned"));
+}
+
+void UITask::onMeshtasticUnsyncedChannel(const char *text, bool outgoing, uint32_t id) {
+  const char *name = "Archived: channel during sync";
+  const int thread = findOrCreateThread(name, true);
+  if (thread < 0) return;
+  _ui_threads[thread].mesh_channel_slot = -1;
+  memset(_ui_threads[thread].mesh_contact_pub, 0, sizeof(_ui_threads[thread].mesh_contact_pub));
+  appendMessage(name, outgoing ? "me" : "node", text ? text : "", true, outgoing, !outgoing,
+                id, outgoing ? DELIV_UNCONFIRMED : DELIV_NONE);
+}
+
+#endif
+
 void UITask::onMessageAcked(uint32_t ack_hash) {
   if (ack_hash == 0) return;
   bool any = false;
@@ -76574,6 +78347,9 @@ void UITask::onMessageAcked(uint32_t ack_hash) {
     if (m.ack_hash == 0) continue;
     if (m.ack_hash == ack_hash && m.deliv_state != DELIV_DELIVERED) {
       m.deliv_state = DELIV_DELIVERED;
+      m.delivery_error = 0;
+      segMarkSeqDirty(m.seq);
+      markMsgsDirty();
       any = true;
     }
   }
@@ -76644,7 +78420,16 @@ void UITask::sortThreadsByRecent(bool channel_mode, int out_indexes[], int& out_
   }
   for (int i = 0; i < out_count; ++i) {
     for (int j = i + 1; j < out_count; ++j) {
-      if (_ui_threads[out_indexes[j]].last_ts > _ui_threads[out_indexes[i]].last_ts) {
+      bool before = _ui_threads[out_indexes[j]].last_ts > _ui_threads[out_indexes[i]].last_ts;
+#if defined(WADA_MESHTASTIC)
+      if (channel_mode) {
+        const int a = _ui_threads[out_indexes[i]].mesh_channel_slot;
+        const int b = _ui_threads[out_indexes[j]].mesh_channel_slot;
+        if ((a >= 0) != (b >= 0)) before = b >= 0;
+        else if (a >= 0 && b >= 0) before = b < a;
+      }
+#endif
+      if (before) {
         int tmp = out_indexes[i]; out_indexes[i] = out_indexes[j]; out_indexes[j] = tmp;
       }
     }
@@ -76761,9 +78546,23 @@ bool UITask::sendComposerToActiveThread(const char* override_text) {
   // Standard Arabic letters, not the field's presentation forms (#582), cut to
   // MAX_TEXT_LEN on a whole character.
   char truncated[MAX_TEXT_LEN + 1];
+#if defined(WADA_MESHTASTIC)
+  if (!wadaNormalizeMessage(text, truncated, sizeof(truncated), false)) {
+    showAlert(TR("Message is too long or invalid UTF-8; nothing was sent"), 3000);
+    return false;
+  }
+#else
   arabicUnshape(text, truncated, sizeof(truncated));
+#endif
 
   if (_active_thread_is_channel) {
+#if defined(WADA_MESHTASTIC)
+    refreshNativeChannels();
+    if (!channelThreadAvailable(_active_thread_idx)) {
+      showAlert(TR("This channel is archived or unavailable. Choose an active channel in Settings."), 3000);
+      return false;
+    }
+#endif
     const char* thread_name = _ui_threads[_active_thread_idx].name;
     int16_t slot = _ui_threads[_active_thread_idx].mesh_channel_slot;
     ChannelDetails cd;
@@ -76806,9 +78605,12 @@ bool UITask::sendComposerToActiveThread(const char* override_text) {
       return false;
     }
     appendMessage(_ui_threads[_active_thread_idx].name, sender, truncated, true, true, false,
-                  0, DELIV_NONE, 0, 0, 0, 0, nullptr, 0, the_mesh.uiLastSentFp());
+                  the_mesh.uiLastSentFp(), DELIV_PENDING, 0, 0, 0, 0, nullptr, 0, the_mesh.uiLastSentFp());
+#if defined(WADA_MESHTASTIC)
+    g_lv.ch.follow_own_send = true;
+#endif
     if (!override_text) resetComposer();   // a resend must not wipe a half-typed draft
-    showAlert(TR("Sent"), 900);
+    showAlert(TR("Queued"), 900);
     return true;
   }
 
@@ -76855,6 +78657,13 @@ bool UITask::sendComposerToActiveThread(const char* override_text) {
     return false;
   }
   recipient = *by_pub;
+#if defined(WADA_MESHTASTIC)
+  const uint32_t nativeRecipient = WadaMeshtasticBackend::keyNode(recipient.id.pub_key);
+  if (wadaBackend && !wadaBackend->canMessage(nativeRecipient)) {
+    showAlert(wadaBackend->directMessageReason(nativeRecipient), 3000);
+    return false;
+  }
+#endif
   ContactInfo tx_recipient = recipient;
   // Deterministic touch send behavior: avoid stale direct-path state by forcing
   // per-message flood routing for DM sends.
@@ -76897,9 +78706,12 @@ bool UITask::sendComposerToActiveThread(const char* override_text) {
   // matches it and fires UITask::onMessageAcked → bubble flips to ✓✓.
   the_mesh.uiRegisterExpectedAck(expected_ack, recipient.id.pub_key);
   appendMessage(_ui_threads[_active_thread_idx].name, sender, truncated, false, true, false,
-                expected_ack, DELIV_SENT, 0, 0, 0, 0, nullptr, 0, the_mesh.uiLastSentFp());
+                expected_ack, DELIV_PENDING, 0, 0, 0, 0, nullptr, 0, the_mesh.uiLastSentFp());
+#if defined(WADA_MESHTASTIC)
+  g_lv.dm.follow_own_send = true;
+#endif
   if (!override_text) resetComposer();   // a resend must not wipe a half-typed draft
-  showAlert(TR("Sent"), 900);
+  showAlert(TR("Queued"), 900);
   return true;
 }
 
@@ -78662,8 +80474,12 @@ void UITask::toggleBuzzer() {
 }
 
 bool UITask::getGPSState() {
+#if defined(WADA_MESHTASTIC)
+  return wadaBackend && wadaBackend->positionSettings().gps_mode == meshtastic_Config_PositionConfig_GpsMode_ENABLED;
+#else
   if (!_node_prefs) return false;
   return _node_prefs->gps_enabled != 0;
+#endif
 }
 
 #if defined(HAS_EXPANSION_KIT)
@@ -78809,6 +80625,23 @@ bool UITask::getLocalEnvSummary(char* buf, size_t cap) const {
 #endif  // HAS_EXPANSION_KIT
 
 void UITask::toggleGPS() {
+#if defined(WADA_MESHTASTIC)
+  if (!wadaBackend || !wadaBackend->channelsReady() || wadaBackend->isManaged()) {
+    showAlert(TR("GPS settings are unavailable until this node is synchronized and editable"), 2400);
+    return;
+  }
+  if (wadaBackend->positionSettings().gps_mode == meshtastic_Config_PositionConfig_GpsMode_NOT_PRESENT) {
+    showAlert(TR("No GPS receiver is configured"), 2000);
+    return;
+  }
+  meshtastic_Config c = {};
+  c.which_payload_variant = meshtastic_Config_position_tag;
+  c.payload_variant.position = wadaBackend->positionSettings();
+  c.payload_variant.position.gps_mode = getGPSState() ? meshtastic_Config_PositionConfig_GpsMode_DISABLED
+                                                    : meshtastic_Config_PositionConfig_GpsMode_ENABLED;
+  persistHistoryNow();
+  showAlert(wadaBackend->setConfig(c) ? TR("GPS update requested") : TR("Could not queue GPS update"), 2000);
+#else
   if (!_node_prefs) return;
   // Critical: just flipping the pref bit does NOT power the GPS hardware.
   // The companion-serial CMD_SET_CUSTOM_VAR("gps") path delegates to
@@ -78855,6 +80688,7 @@ void UITask::toggleGPS() {
   // gpsStatusStr treats 0 as "not started yet".
   { const uint32_t t = millis(); s_gps_acq_since = target_on ? (t ? t : 1u) : 0u; }
   the_mesh.savePrefs();
+#endif
 }
 
 void UITask::setGpsPower(bool on) {
@@ -79107,7 +80941,7 @@ void UITask::setExperimentalFlags(uint8_t multi_acks, uint8_t client_repeat, uin
   the_mesh.savePrefs();
   // Boosted gain is a radio register: set it now, the way the phone app's radio command
   // does (CMD_SET_RADIO_PARAMS in MyMesh), instead of leaving it for the next boot.
-#if defined(USE_SX1262) || defined(USE_SX1268) || defined(USE_LR1121) || defined(USE_LR2021) || defined(SX126X_RX_BOOSTED_GAIN)
+#if !defined(WADA_MESHTASTIC) && (defined(USE_SX1262) || defined(USE_SX1268) || defined(USE_LR1121) || defined(USE_LR2021) || defined(SX126X_RX_BOOSTED_GAIN))
   radio_driver.radioAcquire();
   radio_driver.setRxBoostedGainMode(_node_prefs->rx_boosted_gain != 0);
   radio_driver.radioRelease();
@@ -79166,7 +81000,10 @@ static void touchPanelSleep(bool slp) {
 // redraw. Safe alongside LVGL: flushes run on this same task (no concurrent
 // bus use), and the datasheet allows memory writes while asleep.
 static void touchPanelCmd(uint8_t cmd) {
-#if defined(HAS_THINKNODE_M9)
+#if defined(WADA_MESHTASTIC)
+  wadaSpiLock();
+  SPIClass* const bus = &SPI;
+#elif defined(HAS_THINKNODE_M9)
   // The M9 takes ST7789LCDDisplay's default constructor branch: the GLOBAL SPI
   // instance, shared with the LoRa radio, and it deliberately does not define
   // PIN_TFT_SCL/SDA. So use that same bus object rather than standing up a
@@ -79189,6 +81026,9 @@ static void touchPanelCmd(uint8_t cmd) {
   digitalWrite(PIN_TFT_CS, HIGH);
   digitalWrite(PIN_TFT_DC, HIGH);   // back to data (the driver's idle default)
   bus->endTransaction();
+#if defined(WADA_MESHTASTIC)
+  wadaSpiUnlock();
+#endif
 }
 static void touchPanelSleep(bool slp) {
   static bool s_asleep = false;
@@ -79302,7 +81142,7 @@ static inline void touchScreenBacklight(bool on) {
   // the PWM duty directly: 0 = off, saved brightness = on.
   if (!s_bl_pwm_ready) applyBrightness(s_brightness_pct);   // ensure LEDC is attached
   if (on) touchPanelSleep(false);   // wake the panel BEFORE lighting it (old frame intact)
-  ledcWrite(kBlPwmChannel, on ? ((uint32_t)s_brightness_pct * 255u / 100u) : 0u);
+  ledcWriteChannel(kBlPwmChannel, on ? ((uint32_t)s_brightness_pct * 255u / 100u) : 0u);
   if (!on) touchPanelSleep(true);   // then stop the panel driving the crystals (anti burn-in)
 #if defined(HELTEC_LORA_V4_R8)
   // Dark screen: throttle the CHSC6x poll task (8 ms -> 50 ms) — its blocking
@@ -79388,6 +81228,9 @@ static void pagerWifiPsUpdate(int screen_on) {
 #endif
 
 static void setCpuForScreen(bool screen_on) {
+#ifdef WADA_MESHTASTIC
+  (void)screen_on;return;
+#endif
 #if defined(CONFIG_IDF_TARGET_ESP32P4)
   // The P4's Arduino HAL only accepts 360 MHz (240/80 log a "could not be set" error every screen
   // toggle) — no DFS downclock available through this API on that chip, so skip entirely.
@@ -80704,7 +82547,36 @@ static bool uiHistWaitWorkerIdle() {
   return cancelled;
 }
 
+bool UITask::isBleEnabled() const {
+#if defined(WADA_MESHTASTIC)
+  return wadaBackend && wadaBackend->bluetoothConfig().enabled;
+#else
+  return _serial && _serial->isBleEnabled();
+#endif
+}
+void UITask::disableBle() {
+#if defined(WADA_MESHTASTIC)
+  if (!wadaBackend) return;
+  meshtastic_Config c = {};
+  c.which_payload_variant = meshtastic_Config_bluetooth_tag;
+  c.payload_variant.bluetooth = wadaBackend->bluetoothConfig();
+  c.payload_variant.bluetooth.enabled = false;
+  persistHistoryNow();
+  showAlert(wadaBackend->setConfig(c) ? TR("Bluetooth update requested") : TR("Could not queue Bluetooth update"), 2000);
+#else
+  if (_serial) _serial->disableBle();
+#endif
+}
+
 bool UITask::enableBle() {
+#if defined(WADA_MESHTASTIC)
+  if (!wadaBackend) return false;
+  persistHistoryNow();
+  meshtastic_Config c={};c.which_payload_variant=meshtastic_Config_bluetooth_tag;
+  c.payload_variant.bluetooth=wadaBackend->bluetoothConfig();
+  c.payload_variant.bluetooth.enabled=true;
+  return wadaBackend->setConfig(c);
+#endif
   if (!_serial) return false;
 #if defined(TLORA_PAGER)
   if (bleEnableWaitingForWifi()) {
@@ -80769,7 +82641,12 @@ void UITask::rebootDevice() {
   the_mesh.persistSyncHistoryNow();  // and the app-sync replay ring
   touchPrefsSetClockFloor(rtc_clock.getFloor());   // preserve protocol monotonicity across this reboot
   touchPrefsFlush();       // finish queued A/B snapshots before reset
+#if defined(WADA_MESHTASTIC)
+  const bool queued = wadaBackend && wadaBackend->power(false);
+  showAlert(queued ? TR("Reboot requested") : TR("Could not queue reboot"), 2200);
+#else
   if (_board) _board->reboot();
+#endif
 }
 
 #if CAP_CONSOLE && defined(ESP32)
@@ -81336,14 +83213,32 @@ static void atGlanceShow(const GlanceMsg& m, bool fade_in) {
 // sender parsing + thread routing in one place so the meta-aware path doesn't
 // drift from the plain path. `meta_flags` is 0 (no RX metadata) when called
 // from base newMsg; the touch UI ignores zero-meta entries in the Info popup.
+#if defined(WADA_MESHTASTIC)
+static bool wadaNativeChannelMuted(const char *name) {
+  if (!wadaBackend || !name) return false;
+  ChannelDetails channel{};
+  for (unsigned index = 0; index < 8; ++index) {
+    if (!the_mesh.getChannel(index, channel) || strcmp(channel.name, name)) continue;
+    const auto &settings = wadaBackend->channelConfig(index).settings;
+    return settings.has_module_settings && settings.module_settings.is_muted;
+  }
+  return false;
+}
+#endif
 void UITask::newMsgImpl(uint8_t path_len, const char* from_name, const char* text, int msgcount,
                         uint8_t meta_flags, int8_t snr_q4, int8_t rssi,
-                        const char* sender_override) {
+                        const char* sender_override, bool native_muted) {
   (void)path_len;
   _msgcount = msgcount;
 
   const bool have_sender_override = (sender_override && sender_override[0]);
   bool channel = (g_last_event == UIEventType::channelMessage);
+#if defined(WADA_MESHTASTIC)
+  if (channel) {
+    refreshNativeChannels();
+    native_muted = native_muted || wadaNativeChannelMuted(from_name);
+  }
+#endif
   const char* thread = channel
       ? (from_name && from_name[0] ? from_name : "#unknown")
       : (from_name && from_name[0] ? from_name : "Unknown");
@@ -81438,7 +83333,7 @@ void UITask::newMsgImpl(uint8_t path_len, const char* from_name, const char* tex
     na.snd_direct   = touchPrefsGetSoundDirect();
     na.snd_messages = touchPrefsGetSoundMessages();
     na.sound_quiet  = isBuzzerQuiet();
-    na.dnd          = dndActive();
+    na.dnd          = dndActive() || native_muted;
 #if defined(HAS_UI_VIBRATE)
     na.vibrate_on   = touchPrefsGetVibrate();
 #endif
@@ -81453,7 +83348,7 @@ void UITask::newMsgImpl(uint8_t path_len, const char* from_name, const char* tex
   // Vibration motor: the same messages that would chime (the per-kind switches,
   // the channel mute bits and Do Not Disturb all apply), but its own switch rather
   // than the Sound master, so a pager can be silent and still buzz in a pocket.
-  if (touchPrefsGetVibrate() && !dndActive()) {
+  if (touchPrefsGetVibrate() && !dndActive() && !native_muted) {
     const bool is_mention = channel && text && textMentionsMe(text);
     const bool is_dm = (g_last_event == UIEventType::contactMessage);
     const uint8_t cmute = channel ? touchPrefsGetChannelMute(thread) : 0;
@@ -81489,9 +83384,9 @@ void UITask::newMsgImpl(uint8_t path_len, const char* from_name, const char* tex
   // mute bit, so a channel muted for chatter can still surface an @-mention.
 #if defined(ESP32)
   const uint8_t glance_cmute = channel ? touchPrefsGetChannelMute(thread) : 0;
-  const bool glance_muted = channel &&
+  const bool glance_muted = native_muted || (channel &&
       (textMentionsMe(text) ? (glance_cmute & TOUCH_CHMUTE_MEN) != 0
-                            : (glance_cmute & TOUCH_CHMUTE_MSG) != 0);
+                            : (glance_cmute & TOUCH_CHMUTE_MSG) != 0));
 #else
   const bool glance_muted = false;
 #endif
@@ -81673,8 +83568,16 @@ void UITask::newMsgFromPubWithMeta(uint8_t path_len, bool is_flood,
                                    const char* text, int msgcount,
                                    int8_t snr_q4, int8_t rssi) {
   if (from_pub && touchPrefsIsIgnored(from_pub)) return;   // blocked sender — drop (no chat entry, no notify)
-  const uint8_t meta_flags = MSG_META_HAS_RX | (is_flood ? MSG_META_IS_FLOOD : 0);
-  newMsgImpl(path_len, from_name, text, msgcount, meta_flags, snr_q4, rssi);
+  uint8_t meta_flags = MSG_META_HAS_RX | (is_flood ? MSG_META_IS_FLOOD : 0);
+  bool native_muted = false;
+#if defined(WADA_MESHTASTIC)
+  g_last_event = from_pub ? UIEventType::contactMessage : UIEventType::channelMessage;
+  if (snr_q4 == INT8_MIN && rssi == 0) meta_flags &= ~MSG_META_HAS_RX;
+  if (path_len == 0xff) meta_flags &= ~MSG_META_IS_FLOOD;
+  const auto *node = from_pub && wadaBackend ? wadaBackend->nodeInfo(WadaMeshtasticBackend::keyNode(from_pub)) : nullptr;
+  native_muted = node && node->is_muted;
+#endif
+  newMsgImpl(path_len, from_name, text, msgcount, meta_flags, snr_q4, rssi, nullptr, native_muted);
   // Mirror newMsgFromPub's contact-pub plumbing so the newly-arrived DM
   // resolves back to its contact entry for replies.
   if (!from_pub || !from_name || !from_name[0]) return;
@@ -81726,7 +83629,7 @@ void UITask::appSentMsgToContact(const uint8_t* to_pub, const char* to_name, con
   // companion app. appendMessage creates the thread if it doesn't exist and refreshes the view.
   // sent_fp links a locally-originated send (web/terminal) to the repeats-heard ring (0 = none).
   appendMessage(to_name, sender, text, false /*channel*/, true /*outgoing*/, false /*mark_unread*/,
-                ack_hash, DELIV_SENT, 0, 0, 0, 0, nullptr, 0, sent_fp);
+                ack_hash, DELIV_PENDING, 0, 0, 0, 0, nullptr, 0, sent_fp);
   // Lock the thread to the contact's pubkey so a reply typed on-device resolves it (mirrors the
   // receive path above).
   const int t = findThreadByName(to_name, false);
@@ -81743,13 +83646,16 @@ void UITask::appSentMsgToContact(const uint8_t* to_pub, const char* to_name, con
 
 void UITask::appSentMsgToChannel(const char* channel_name, const char* text, uint32_t sent_fp) {
   if (!channel_name || !channel_name[0] || !text || !text[0]) return;
+#if defined(WADA_MESHTASTIC)
+  refreshNativeChannels();
+#endif
   const char* sender = (_node_prefs && _node_prefs->node_name[0]) ? _node_prefs->node_name : "me";
   // Mirror an app-originated channel message as a local outgoing bubble in the channel thread — the
   // channel-send command otherwise never tells the on-device UI about companion sends (the DM path
   // does, via appSentMsgToContact above). appendMessage creates the thread + refreshes the view.
   // sent_fp links a locally-originated send (web/terminal) to the repeats-heard ring (0 = none).
   appendMessage(channel_name, sender, text, true /*channel*/, true /*outgoing*/, false /*mark_unread*/,
-                0 /*ack_hash*/, DELIV_SENT, 0, 0, 0, 0, nullptr, 0, sent_fp);
+                sent_fp /*packet ID*/, DELIV_PENDING, 0, 0, 0, 0, nullptr, 0, sent_fp);
 }
 
 void UITask::newMsg(uint8_t path_len, const char* from_name, const char* text, int msgcount) {
@@ -81840,7 +83746,7 @@ static bool sdRuntimeLifecycleBusy() {
 #if WADA_WEB_FILE_TRANSFER_SPI_SD
   busy = busy || webFileTransferStorageBusy();
 #endif
-#if defined(MULTI_TRANSPORT_COMPANION)
+#if defined(WADA_NETWORK_UI)
   // The web reader and the Lua audio player are independent SD consumers, so
   // both gate the mount lifecycle. The reader excludes ITSELF: it calls this
   // from its own task while holding the card, and would otherwise deadlock.
@@ -81854,7 +83760,7 @@ static bool sdRuntimeLifecycleBusy() {
 #if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER) || defined(HAS_TDECK_MAX)
   busy = busy || s_notify_playing;
 #endif
-#if CAP_SD && defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION) && CAP_OTA
+#if CAP_SD && defined(ESP32) && defined(WADA_NETWORK_UI) && CAP_OTA
   busy = busy || s_sdfw_request || s_sdfw_state == 1;   // "Save update bin to SD" holds a file open (#734)
 #endif
 #if CAP_SD || defined(TLORA_PAGER)
@@ -82067,7 +83973,7 @@ static void sdHealthTick() {
     return;
   }
 #endif
-#if CAP_SD && defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION) && CAP_OTA
+#if CAP_SD && defined(ESP32) && defined(WADA_NETWORK_UI) && CAP_OTA
   // Worker downloading a firmware bin to /BINS. The worker clears s_sdfw_request the
   // moment it picks the job up, so the request flag alone left the whole download
   // unguarded: a probe or remount here could SD.end() under its open file (#734).
@@ -82101,7 +84007,7 @@ static void sdHealthTick() {
   if (sdProbeAlive()) {
     // Transient failure (card full, bad path, ...) — keep the mount and let the
     // preserved tile queue continue on it.
-#if defined(MULTI_TRANSPORT_COMPANION) && defined(HAS_THINKNODE_M9)
+#if defined(WADA_NETWORK_UI) && defined(HAS_THINKNODE_M9)
     // The note window blanked every SD tile read (loadTileJpeg bails on it) —
     // arm the rate-capped map repaint so pan gaps heal without a keypress.
     if (s_map_last_missing > 0) s_tile_fetch_dirty = true;
@@ -82136,6 +84042,40 @@ static void sdHealthTick() {
 #endif
     mapNoteStorageChanged();   // drop tiles read off the card that just went away
   }
+}
+#endif
+
+#if defined(WADA_MESHTASTIC)
+static void wadaNativeNodeTick() {
+  if (!wadaBackend) return;
+  static uint32_t revision = UINT32_MAX;
+  static bool ready = false, supported = false, removing = false, deferred = false;
+  const uint32_t current = wadaBackend->nodeRevision();
+  const bool nextReady = wadaBackend->nodeSnapshotReady(), nextSupported = wadaBackend->reportsHeardOnCurrentLora();
+  const bool nextRemoving = wadaBackend->removingUnheardNodes();
+  const bool changed = revision != current || ready != nextReady || supported != nextSupported || removing != nextRemoving;
+  if (!changed && (!deferred || wadaIdentityPopupActive())) return;
+  revision = current; ready = nextReady; supported = nextSupported; removing = nextRemoving;
+  if (changed) {
+    s_ct_list_force = true;
+    g_lv.dirty_contacts = true;
+    if (s_ct_filter_btn_lbl) lv_label_set_text_fmt(s_ct_filter_btn_lbl, "%s %s", LV_SYMBOL_DOWN, contactsFilterShortLabel());
+    if (getActiveTab() == MAP_TAB_INDEX) renderMapMarkers();
+  }
+  if (g_set_modal.root && g_set_modal.kind == SettingsModalKind::NativeNodeDetails) {
+    if (wadaIdentityPopupActive()) { deferred = true; return; }
+    deferred = false;
+    const uint32_t number = wadaSelectedNode();
+    if (!wadaBackend->nodeInfo(number)) closeSettingsModal();
+    else if (s_native_details_node != number || s_native_details_stamp != wadaNodeDetailsStamp(number)) {
+      const int scroll = g_set_modal.body ? lv_obj_get_scroll_y(g_set_modal.body) : 0;
+      wadaNodeDetails();
+      if (g_set_modal.body) {
+        lv_obj_update_layout(g_set_modal.body);
+        lv_obj_scroll_to_y(g_set_modal.body, scroll, LV_ANIM_OFF);
+      }
+    }
+  } else deferred = false;
 }
 #endif
 
@@ -82305,6 +84245,7 @@ void UITask::loop() {
 #if defined(ESP32)
   // Snapshot copying is quick; all filesystem I/O runs on the core-0 worker.
   touchPrefsTick(now);
+#if !defined(WADA_MESHTASTIC)
   // One-shot (#178): contacts starred on-device before the flags mirror
   // existed have their favorite only in TouchPrefs — invisible to the core's
   // overwrite-oldest eviction. Stamp flags bit 0 once per boot, after the
@@ -82324,6 +84265,7 @@ void UITask::loop() {
       if (changed) Serial.println("[UI] favorite flags synced into contact table (#178)");
     }
   }
+#endif
 #endif
 #if WADA_WEB_FILE_TRANSFER
   webFileTransferTick();
@@ -82395,7 +84337,7 @@ void UITask::loop() {
   // then walk every screen and stream each framebuffer over USB. The 'G' handshake avoids a
   // flash-vs-connect timing race — the host can attach whenever and trigger the tour.
   { static bool s_doc_done = false;
-#if defined(DOC_MAP_SHOT) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(DOC_MAP_SHOT) && defined(WADA_NETWORK_UI)
     // The map shot needs its tiles, and the tour holds the loop that brings Wi-Fi
     // up, hands the tile cache over once the card mounts and redraws as downloads
     // land. So open the Map first and let the normal loop load it until nothing in
@@ -82424,6 +84366,9 @@ void UITask::loop() {
   uiCp("ui:hist");
   flushHistoryIfDue(now);
   uiCp("ui:ctdirty");
+#if defined(WADA_MESHTASTIC)
+  wadaNativeNodeTick();
+#endif
   // A contact was discovered/updated via an advert — possibly while a companion app was connected
   // over BLE (issue #73). FORCE the rebuild: an advert can fill in a name, or refresh an existing
   // (or app-added) contact, WITHOUT changing getNumContacts() — which the count-cached
@@ -82580,7 +84525,7 @@ void UITask::loop() {
     }
   }
 #endif
-#if CAP_SD || defined(TLORA_PAGER)
+#if (CAP_SD || defined(TLORA_PAGER)) && !defined(WADA_MESHTASTIC)
   // Manual telemetry request timed out — flip the open window to "failed" (it
   // still shows the history). Auto-poll has no deadline, so it never lands here.
   if (s_telem_manual_pending && s_telem_deadline_ms != 0 && now >= s_telem_deadline_ms) {
@@ -82695,7 +84640,7 @@ void UITask::loop() {
       static uint8_t       s_tbh      = TBH_IDLE;
       static unsigned long s_tbh_down = 0;
       const bool down    = tb_pressed && !s_tb_wake_consume;
-      const bool hold_ok = !s_tb_nav && !SnakeGame::isOpen() && !luaAppIsOpen();
+      const bool hold_ok = !s_tb_nav && !WadaSnakeGame::isOpen() && !luaAppIsOpen();
       if (!hold_ok) {
         s_tbh = TBH_IDLE;
         s_tb_click_press = down;
@@ -82839,6 +84784,10 @@ void UITask::loop() {
   // timeout locked the T-Deck Pro on its first pass with the splash still on the
   // glass (#762). ScreenIdleClock.h, host-tested.
   ScreenIdleClock::holdWhileSplash(_last_input_ms, (uint32_t)now, s_splash_root != nullptr);
+#if defined(WADA_MESHTASTIC)
+  static uint32_t lastNotifiedInput=0;
+  if(lastNotifiedInput != _last_input_ms) {lastNotifiedInput=_last_input_ms;wadaInputActivity();}
+#endif
   if (!_screen_off &&
       ScreenIdleClock::due((uint32_t)now, (uint32_t)_last_input_ms, _screen_timeout_ms)) {
 #if CAP_SCREENSAVER
@@ -83724,6 +85673,7 @@ void UITask::loop() {
     }
   }
 
+#if !defined(WADA_MESHTASTIC)
   // Periodic self-advert: the standard MeshCore flood / zero-hop advert on a timer (intervals set
   // in the Advertise app, stored in TouchPrefsStore). Separate from the signal probe above, which
   // only floods when the mesh has gone quiet. First fire lands one full interval after enable/boot.
@@ -83761,6 +85711,8 @@ void UITask::loop() {
     } else s_next_local_adv = 0;
   }
 
+#endif // Native node-info intervals are scheduled by Meshtastic.
+
   uiCp("ui:battlog");
   batteryLogTick((uint32_t)now);   // 5-min battery sample (SD on T-Deck, else SPIFFS)
 #if CAP_SD || defined(TLORA_PAGER)
@@ -83776,7 +85728,7 @@ void UITask::loop() {
 #endif
   wifiScanService();          // draw Wi-Fi scan results when the worker finishes
   ctDeleteServiceTick();      // chunked contacts bulk-delete (advances the progress bar)
-#if CAP_CONTACT_PURGE
+#if CAP_CONTACT_PURGE && !defined(WADA_MESHTASTIC)
   contactPurgeService();      // Settings > Contact Management: remove old contacts (#719)
 #endif
 
@@ -83793,7 +85745,7 @@ void UITask::loop() {
     }
     // Also hard-lock the tab bar while Snake is open so a swipe/tap near the
     // bottom can't slip through to the app switcher (e.g. into the map).
-    const bool want_lock = (now < s_tabbar_lock_until) || SnakeGame::isOpen() || luaAppIsOpen();
+    const bool want_lock = (now < s_tabbar_lock_until) || WadaSnakeGame::isOpen() || luaAppIsOpen();
     if (want_lock != s_tabbar_locked && g_lv.tabview) {
       lv_obj_t* tab_btns = lv_tabview_get_tab_btns(g_lv.tabview);
       if (tab_btns) {
@@ -83881,7 +85833,7 @@ void UITask::loop() {
   display.serviceRefresh();   // one coalesced e-paper update after all LVGL bands
 #endif
   uiCp("ui:tail");
-#if (CAP_SD || defined(TLORA_PAGER)) && \
+#if !defined(WADA_MESHTASTIC) && (CAP_SD || defined(TLORA_PAGER)) && \
   (defined(HAS_TDECK_GT911) || defined(HAS_TDECK_PRO) || defined(HELTEC_LORA_V4_R8) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9))
   sdRestoreRun();   // intentionally outside the LVGL event/render call stack
 #endif
@@ -83945,7 +85897,12 @@ void UITask::loop() {
           char drv[3] = { (char)('0' + pdrv), ':', 0 };
           void* work = malloc(4096);                       // f_mkfs scratch (>= FF_MAX_SS)
           if (work) {
+#if defined(WADA_MESHTASTIC)
+            MKFS_PARM options={};options.fmt=FM_FAT32;
+            if (f_mkfs(drv, &options, work, 4096) == FR_OK) {
+#else
             if (f_mkfs(drv, MC_FM_FAT32, 0, work, 4096) == 0 /*FR_OK*/) {
+#endif
               sdWriteFatLabel(pdrv, "MESHCOMOD");
               mkfs_ok = true;
               ok = true;
@@ -84127,7 +86084,7 @@ static const PopupEnt k_popup_registry[] = {
 #if CAP_USB_FILES
   { P_OPEN(s_usbfiles_root),          []{ closeUsbFilesPage(); },           PF_COUNT },
 #endif
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
   { P_OPEN(s_wifi_sheet),            []{ wifiSheetClose(); },             PF_COUNT },   // was in no registry at all
   { P_OPEN(s_reader_root),           []{ closeReaderPage(); },            PF_COUNT },   // on-device text browser
 #endif
@@ -84154,7 +86111,7 @@ static const PopupEnt k_popup_registry[] = {
   { P_OPEN(s_contacts_search_sheet), []{ closeContactsSearchSheet(); },   PF_COUNT },
   { P_OPEN(s_contacts_overflow_root),[]{ closeContactsOverflowSheet(); }, PF_COUNT },
   { P_OPEN(s_share_my_root),         []{ closeShareMyContact(); },        PF_COUNT },
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(ESP32) && defined(WADA_NETWORK_UI)
   { P_OPEN(s_los_root),              []{ closeLosModal(); },              PF_COUNT },
 #endif
   { P_OPEN(s_admin_root),            []{ closeAdminConsole(); },          PF_COUNT },
@@ -84836,7 +86793,7 @@ static void docLookAudit() {
     }
     closeSettingsCategory(); docSettle(6);
   }
-#if defined(DOC_MAP_SHOT) && defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+#if defined(DOC_MAP_SHOT) && defined(ESP32) && defined(WADA_NETWORK_UI)
   // The map for the guide, once its tiles are really there. The tour holds the loop
   // that re-renders as downloads land (the last guide shot caught it half loaded,
   // "29 downloading"), so do that here: redraw on each delivery until nothing in
@@ -86099,3 +88056,23 @@ static void docAuditFocus() {
 }
 #endif
 #endif  // DOC_CAPTURE
+
+#if defined(WADA_MESHTASTIC)
+void UITask::onMeshtasticDelivery(uint32_t id, uint8_t state, uint8_t error) {
+  const uint8_t delivery = WadaDeliveryUI::stored(static_cast<WadaDelivery::State>(state));
+  if (!_ui_msgs) return;
+  for (int i = 0; i < _ui_msg_cap; ++i) {
+    if (_ui_msgs[i].outgoing && _ui_msgs[i].ack_hash == id) {
+      _ui_msgs[i].deliv_state = delivery;
+      _ui_msgs[i].delivery_error = error;
+      segMarkSeqDirty(_ui_msgs[i].seq);
+    }
+  }
+  onThreadsChanged();
+  markMsgsDirty();
+  g_lv.dirty_timeline = true;
+  g_lv.dirty_threads = true;
+  ++s_deliv_gen;
+}
+
+#endif
